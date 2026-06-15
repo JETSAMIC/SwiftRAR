@@ -1,11 +1,11 @@
 import Foundation
 
-/// Static lookup tables for the RAR3 LZSS bit format.
+/// Static lookup tables for the RAR3 (Unpack29) LZSS bit format.
 ///
 /// These tables describe how the variable-length match-length and
 /// match-distance symbols emitted by the Huffman decoder expand into
 /// numeric values. Each table mirrors the constants documented in the
-/// public `technote.txt` shipped with WinRAR 4.x, and replicated in
+/// public `technote.txt` shipped with WinRAR 4.x and replicated in
 /// clean-room reimplementations (rarfile / bitjs unrar.js).
 ///
 /// The encoding scheme is uniform:
@@ -17,16 +17,34 @@ import Foundation
 /// Huffman symbol to disambiguate the value within `base..<nextBase`.
 enum RAR3Tables {
 
+    // MARK: - Alphabet sizes (Unpack29)
+    /// Main alphabet: literals (0..255) + end-of-block (256) + VM filter
+    /// (257) + repeat-last-match (258) + 4 recent distances (259..262) +
+    /// 9 short matches (263..271) + 27 length codes (272..298). Total 299.
+    static let mainAlphabetSize: Int = 299
+    /// Distance alphabet — 60 symbols cover 1..2^32 via DBitLengthCounts.
+    static let distanceAlphabetSize: Int = 60
+    /// Low-distance alphabet — 16 raw symbols (low nibble of distance) +
+    /// 1 repeat marker. Used only when the matched distance symbol's
+    /// extra-bit count exceeds 3.
+    static let lowDistanceAlphabetSize: Int = 17
+    /// Length alphabet used to disambiguate match length when the main
+    /// symbol is one of the 4 "recent distance" references (259..262).
+    static let lengthAlphabetSize: Int = 28
+    /// Pre-tree alphabet used to RLE-encode the four real Huffman tables.
+    static let preTreeAlphabetSize: Int = 20
+
+    /// Combined number of code lengths transmitted per table-refresh
+    /// block (main + distance + lowDist + length).
+    static let totalCodeLengths: Int =
+        mainAlphabetSize + distanceAlphabetSize +
+        lowDistanceAlphabetSize + lengthAlphabetSize
+
     // MARK: - Length alphabet (28 symbols → length 2..258)
 
-    /// Base length for length symbols 0..27. Length codes are decoded
-    /// from the "length" (a.k.a. low-length) Huffman tree and combined
-    /// with `lengthBitTable` extra bits.
-    ///
-    /// Final length values cover the inclusive range [2, 258]:
-    ///   * Symbols 0..7   → exact lengths 2..9 (0 extra bits each).
-    ///   * Symbols 8..27  → run-encoded lengths in geometric steps of
-    ///     2, 4, 8 … bits, terminating at base 227 + 5 extra bits = 258.
+    /// Base length for length symbols 0..27. Combined with `lengthBitTable`
+    /// extra bits and an implicit +2 offset applied at copy time, these
+    /// cover the inclusive range [2, 258].
     static let lengthTable: [Int] = [
           0,   1,   2,   3,   4,   5,   6,   7,
           8,  10,  12,  14,  16,  20,  24,  28,
@@ -34,11 +52,7 @@ enum RAR3Tables {
         128, 160, 192, 224
     ]
 
-    /// Extra bits to read from the stream after each length symbol to
-    /// disambiguate the final length. Sums of `lengthTable[i] + (1 <<
-    /// lengthBitTable[i]) - 1` form a contiguous covering of 0..226 with
-    /// the final entry stretching to 227 + 31 = 258 (offset by the +2
-    /// applied at the call site).
+    /// Extra bits to read after each length symbol.
     static let lengthBitTable: [Int] = [
         0, 0, 0, 0, 0, 0, 0, 0,
         1, 1, 1, 1, 2, 2, 2, 2,
@@ -46,100 +60,120 @@ enum RAR3Tables {
         5, 5, 5, 5
     ]
 
-    /// Smallest length actually returned by the decoder. RAR3 disallows
-    /// "copy 0 bytes" and "copy 1 byte" matches (the encoder always
-    /// chooses a literal in that case), so the smallest value a length
-    /// code can produce is 2 — `lengthTable` values are offsets above 2.
+    /// Smallest length actually returned by the decoder. Add this to the
+    /// `lengthTable[symbol] + extra` value to get the final match length.
     static let minLength: Int = 2
 
     // MARK: - Distance alphabet (60 symbols → distance 1..2^32)
 
-    /// Base distance for distance symbols 0..59. Combined with the
-    /// `distanceBitTable` extra-bit counts these cover the full 32-bit
-    /// distance range — although RAR3's 4 MB sliding window means the
-    /// effective maximum is 0x400000 (the encoder declines to emit larger
-    /// distances). Decoder still accepts the full range to be tolerant of
-    /// non-conforming encoders.
-    static let distanceTable: [Int] = [
-              0,         1,         2,         3,         4,         6,
-              8,        12,        16,        24,        32,        48,
-             64,        96,       128,       192,       256,       384,
-            512,       768,      1024,      1536,      2048,      3072,
-           4096,      6144,      8192,     12288,     16384,     24576,
-          32768,     49152,     65536,     98304,    131072,    196608,
-         262144,    327680,    393216,    458752,    524288,    589824,
-         655360,    720896,    786432,    851968,    917504,    983040,
-        1048576,   1310720,   1572864,   1835008,   2097152,   2359296,
-        2621440,   2883584,   3145728,   3407872,   3670016,   3932160
+    /// Per-bit-length count used to derive `distanceTable` and
+    /// `distanceBitTable` at type-load time. Read as: 4 codes with
+    /// extra-bits = 0, 2 codes with extra-bits = 1, 2 with extra-bits =
+    /// 2, … and so on through 28 (final entry covers 12 codes of
+    /// extra-bits = 18). Sum is 60.
+    static let distanceBitLengthCounts: [Int] = [
+        4, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+        2, 2, 2, 2, 2, 2, 14, 0, 12
     ]
 
-    /// Extra bits to read after each distance symbol. The first four
-    /// symbols (0..3) are direct: their distance is `distanceTable[i]`
-    /// and no extra bits are read. Beyond symbol 3, the extra-bit count
-    /// is `(symbol / 2) - 1`, growing in lockstep with `distanceTable`.
+    /// Base distance for distance symbols 0..59, computed from
+    /// `distanceBitLengthCounts` by cumulative geometric expansion:
     ///
-    /// Symbols 16..27 emit 4..7 extra bits *as a contiguous integer* —
-    /// the "high bits" of the distance. Symbols 28..59 emit their high
-    /// bits via the same direct path but the *low four bits* of the
-    /// final distance are sourced from the low-distance Huffman tree
-    /// (see `lowDistanceTable`). The driver enforces this split.
-    static let distanceBitTable: [Int] = [
-         0,  0,  0,  0,  1,  1,  2,  2,
-         3,  3,  4,  4,  5,  5,  6,  6,
-         7,  7,  8,  8,  9,  9, 10, 10,
-        11, 11, 12, 12, 13, 13, 14, 14,
-        15, 15, 16, 16, 17, 17, 18, 18,
-        19, 19, 20, 20, 21, 21, 22, 22,
-        23, 23, 24, 24, 25, 25, 26, 26,
-        27, 27, 28, 28
-    ]
+    ///   dist = 0; bitLen = 0
+    ///   for groupCount in distanceBitLengthCounts:
+    ///     for _ in 0..<groupCount:
+    ///       emit(dist); dist += 1 << bitLen
+    ///     bitLen += 1
+    static let distanceTable: [Int] = {
+        var result: [Int] = []
+        result.reserveCapacity(distanceAlphabetSize)
+        var dist = 0
+        var bitLen = 0
+        for groupCount in distanceBitLengthCounts {
+            for _ in 0..<groupCount {
+                result.append(dist)
+                dist &+= 1 << bitLen
+            }
+            bitLen += 1
+        }
+        return result
+    }()
 
-    /// Smallest distance symbol whose low four bits come from the
+    /// Extra bits to read after each distance symbol.
+    static let distanceBitTable: [Int] = {
+        var result: [Int] = []
+        result.reserveCapacity(distanceAlphabetSize)
+        var bitLen = 0
+        for groupCount in distanceBitLengthCounts {
+            for _ in 0..<groupCount {
+                result.append(bitLen)
+            }
+            bitLen += 1
+        }
+        return result
+    }()
+
+    /// Smallest distance symbol whose low 4 bits come from the
     /// `lowDistance` Huffman alphabet rather than directly from the
-    /// bitstream. The block driver checks `symbol >= splitDistance` to
-    /// route into the low-distance decoder.
-    static let lowDistanceSplit: Int = 28
+    /// bitstream. The block driver checks `extraBits > 3` to route into
+    /// the low-distance decoder.
+    static let lowDistanceLowBitCount: Int = 4
 
-    // MARK: - Low-distance alphabet (16 symbols + 1 repeat marker)
+    // MARK: - Low-distance alphabet (16 codes + 1 repeat marker)
 
     /// 17-symbol alphabet used to encode the low 4 bits of any distance
-    /// whose `distanceBitTable` extra-bit count exceeds 3 (symbol ≥ 28).
+    /// whose `distanceBitTable` extra-bit count exceeds 3.
     ///
-    /// Symbols 0..15 are taken verbatim as the low nibble of the final
-    /// distance. Symbol 16 is a run-length repeat marker: it re-uses the
-    /// previously decoded low-distance symbol. The block driver tracks
-    /// the last low-distance symbol seen across the block.
-    static let lowDistanceSymbolCount: Int = 16
+    /// Symbols 0..15 are taken verbatim as the low nibble. Symbol 16 is
+    /// a run-length repeat marker: re-emit the previously decoded
+    /// low-distance value, repeating until a different value arrives.
     static let lowDistanceRepeatSymbol: Int = 16
-    static let lowDistanceAlphabetSize: Int = 17
 
-    // MARK: - Short match alphabet (8 symbols)
+    // MARK: - Short match alphabet (main symbols 263..271)
 
-    /// Short matches are a RAR3 optimisation for very small match
-    /// distances. Distance symbols 0..7 within the *main alphabet*
-    /// (mapped through `shortDistanceBase` below) cover the eight most
-    /// common short ranges; their lengths come from a fixed mapping:
+    /// Short matches encode small distances paired with a fixed length
+    /// of 2 — RAR3 emits main symbols 263..270 (8 codes); the offset
+    /// `symbol - 263` indexes `shortBaseTable` for the base distance and
+    /// `shortBitTable` for the extra-bit count.
     ///
-    ///   short symbol 0 → length 2, no extra bits
-    ///   short symbol 1 → length 3, no extra bits
-    ///   short symbol 2 → length 3 + readBits(2)
-    ///   short symbol 3 → length 4 + readBits(0)
-    ///   short symbol 4 → length 4 + readBits(2)
-    ///   short symbol 5 → length 5 + readBits(3)
-    ///   short symbol 6 → length 4 + readBits(4)
-    ///   short symbol 7 → length 4 + readBits(5)
-    ///
-    /// Those tables are encoded as base + extra-bits pairs below. The
-    /// short alphabet is only consulted for *main* Huffman symbols
-    /// 259..262 — the driver maps `mainSymbol - 259` to a short symbol
-    /// index.
+    /// Match length is always 2 (no further bits needed).
+    static let shortMatchSymbolBase: Int = 263
+    static let shortMatchSymbolCount: Int = 8
+    static let shortMatchLength: Int = 2
+
+    /// Base distance for short match symbols (index = main symbol - 263).
     static let shortBaseTable: [Int] = [
         0, 4, 8, 16, 32, 64, 128, 192
     ]
 
-    /// Extra bits per short distance symbol. Combined with
-    /// `shortBaseTable` these produce distances 0..255 in eight bins.
+    /// Extra bits to read after each short match symbol.
     static let shortBitTable: [Int] = [
         2, 2, 3, 4, 5, 6, 6, 6
     ]
+
+    // MARK: - Main alphabet semantic constants
+
+    /// End-of-block marker: triggers re-read of code-length tables (or
+    /// final termination on the last block).
+    static let mainEndOfBlock: Int = 256
+    /// VM filter spec follows. The 4-byte spec is consumed and ignored
+    /// in this implementation — output bytes pass through without
+    /// E8/E8E9 or other filter correction. Common image, text and
+    /// generic-binary archives don't depend on filters for correctness.
+    static let mainVMFilter: Int = 257
+    /// Reuse previous match: length comes from `lastLength`, distance
+    /// from `recentDistances[0]`.
+    static let mainRepeatLastMatch: Int = 258
+    /// Range of "recent distance" symbols. The decoded symbol minus 259
+    /// selects one of the four most recently used distances; length is
+    /// then decoded from the length alphabet.
+    static let mainRecentDistanceBase: Int = 259
+    static let mainRecentDistanceCount: Int = 4
+    /// First "regular" length+distance match symbol. Length code =
+    /// `mainSymbol - mainLengthSymbolBase`; distance code follows from
+    /// the distance alphabet.
+    static let mainLengthSymbolBase: Int = 271
+
+    /// Number of slots in the recent-distance ring buffer.
+    static let recentDistanceSlots: Int = 4
 }
