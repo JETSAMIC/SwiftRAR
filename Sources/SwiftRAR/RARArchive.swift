@@ -71,11 +71,16 @@ public enum RARArchive {
         switch entry.compressionMethod {
         case 0x30:
             return try StoreExtractor.extract(entry, from: data)
-        default:
-            // The doc comment on `RAR3LZSSDecoder.decompress` records why
-            // this path is intentionally a stub. Throw the typed error so
-            // callers can present a helpful "unsupported compression" UI.
+        case 0x31, 0x32, 0x33, 0x34, 0x35:
+            // RAR3 LZSS — all five "fastest..best" methods share the same
+            // bitstream format; they differ only in encoder-side match-finder
+            // heuristics. A single decoder serves the whole family.
             return try RAR3LZSSDecoder.decompress(entry, from: data)
+        default:
+            // Anything else — typically RAR5 method bits or an unknown future
+            // method — bubbles up so the caller can surface a "please use
+            // The Unarchiver" message instead of a parse error.
+            throw RARError.unsupportedCompression(method: entry.compressionMethod)
         }
     }
 
