@@ -165,3 +165,144 @@ struct RAR3HuffmanDecoder {
         throw RARError.unsupportedFeature("Huffman decode failed — no code matched prefix")
     }
 }
+
+// MARK: - RAR3 code-length table decoder
+
+/// RAR3 transmits its four real Huffman tables (main, distance, low-distance,
+/// length) as a single flat array of code lengths. That array is itself
+/// compressed using a small "pre-tree" Huffman that's described inline as 20
+/// fixed-width 4-bit lengths.
+///
+/// The decoder used by `decodeCodeLengths(from:count:previous:)` reproduces
+/// the algorithm in `unpack30.cpp` (clean-room implementation):
+///
+///   1. Read 20 pre-tree lengths. A length of `15` followed by a 4-bit `0`
+///      means "literal length 15"; a length of `15` followed by a non-zero
+///      4-bit value `n` means "the next `n+2` pre-tree lengths are zero" and
+///      consumes those slots in the pre-tree alphabet itself.
+///   2. Build the pre-tree Huffman from those 20 lengths.
+///   3. Decode `count` real code-length values, where each pre-tree symbol
+///      means:
+///        - `0..15`: literal length, but XOR-added to the *previous* table's
+///          slot value (modulo 16). The "previous" table is the value of
+///          the same code-lengths array from the prior block, or all zeros
+///          for the first block.
+///        - `16`: repeat the just-emitted code length 3..10 times (read 3
+///          extra bits, repeat count = `bits + 3`).
+///        - `17`: repeat the just-emitted code length 11..138 times (read 7
+///          extra bits, count = `bits + 11`).
+///        - `18`: emit zero 3..10 times (read 3 extra bits, count = `bits + 3`).
+///        - `19`: emit zero 11..138 times (read 7 extra bits, count = `bits + 11`).
+///
+/// The signed delta from `previous` is what makes table compression so
+/// effective in practice: consecutive blocks tend to use nearly identical
+/// trees, so most pre-tree symbols are `0` (literal "no change") and the
+/// table comes through as a long zero run.
+///
+/// - Parameters:
+///   - stream: the bit stream positioned at the first pre-tree length nibble.
+///   - count: number of code-length values to produce (typically
+///     `RAR3Tables.totalCodeLengths`, i.e. 404).
+///   - previous: prior block's code lengths used for delta decoding. Pass an
+///     array of zeros for the first block.
+/// - Returns: the decoded code lengths.
+/// - Throws: `RARError.unsupportedFeature` on malformed input.
+func decodeRAR3CodeLengths(
+    from stream: inout BitStream,
+    count: Int,
+    previous: [UInt8]
+) throws -> [UInt8] {
+    let preTreeSize = RAR3Tables.preTreeAlphabetSize
+
+    // 1. Read the 20 pre-tree lengths.
+    var preLengths = [UInt8](repeating: 0, count: preTreeSize)
+    var index = 0
+    while index < preTreeSize {
+        let length = UInt8(stream.readBits(4))
+        if length == 15 {
+            let zeroCount = stream.readBits(4)
+            if zeroCount == 0 {
+                preLengths[index] = 15
+                index += 1
+            } else {
+                // Insert `zeroCount + 2` zeros into the pre-tree itself.
+                // The slot we're standing in (currently 15) becomes the
+                // first zero of the run.
+                var run = Int(zeroCount) + 2
+                while run > 0 && index < preTreeSize {
+                    preLengths[index] = 0
+                    index += 1
+                    run -= 1
+                }
+            }
+        } else {
+            preLengths[index] = length
+            index += 1
+        }
+    }
+
+    // 2. Build the pre-tree.
+    let preTree = try RAR3HuffmanDecoder(codeLengths: preLengths)
+
+    // 3. Decode `count` code lengths, applying delta XOR against `previous`.
+    var result = [UInt8](repeating: 0, count: count)
+    var i = 0
+    while i < count {
+        let symbol = try preTree.decode(&stream)
+        switch symbol {
+        case 0...15:
+            // Literal length, delta-XOR'd against previous block's slot.
+            let prev = i < previous.count ? previous[i] : 0
+            result[i] = (UInt8(symbol) &+ prev) & 0x0F
+            i += 1
+        case 16:
+            // Repeat the just-emitted length 3..10 times.
+            let runLength = Int(stream.readBits(3)) + 3
+            // RAR3 nuance: "previous" here means the previously emitted
+            // *output* slot, not the previous block's slot. If we have
+            // no emitted slot yet, fall back to zero (corrupt but
+            // tolerated rather than crashing).
+            let value = i > 0 ? result[i - 1] : 0
+            var run = runLength
+            while run > 0 && i < count {
+                result[i] = value
+                i += 1
+                run -= 1
+            }
+        case 17:
+            // Repeat the just-emitted length 11..138 times.
+            let runLength = Int(stream.readBits(7)) + 11
+            let value = i > 0 ? result[i - 1] : 0
+            var run = runLength
+            while run > 0 && i < count {
+                result[i] = value
+                i += 1
+                run -= 1
+            }
+        case 18:
+            // Insert 3..10 zero lengths.
+            let runLength = Int(stream.readBits(3)) + 3
+            var run = runLength
+            while run > 0 && i < count {
+                result[i] = 0
+                i += 1
+                run -= 1
+            }
+        case 19:
+            // Insert 11..138 zero lengths.
+            let runLength = Int(stream.readBits(7)) + 11
+            var run = runLength
+            while run > 0 && i < count {
+                result[i] = 0
+                i += 1
+                run -= 1
+            }
+        default:
+            throw RARError.unsupportedFeature(
+                "RAR3 pre-tree emitted symbol \(symbol) outside 0..19"
+            )
+        }
+    }
+    return result
+}
+
