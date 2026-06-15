@@ -72,10 +72,13 @@ final class StoreTests: XCTestCase {
         }
     }
 
-    func testExtractRejectsCompressedEntry() {
-        // Synthesise an entry that claims compression method 0x33; ensure
-        // the public extract throws unsupportedCompression without ever
-        // touching the bytes.
+    func testExtractRejectsMalformedCompressedEntry() {
+        // Method 0x33 is one of the five RAR3 LZSS variants — those now
+        // dispatch into the real decoder. Feeding it 100 bytes of zeros
+        // is structurally invalid (the all-zero pre-tree contains no
+        // codeable symbols), so the decoder must surface a typed
+        // RARError rather than crashing. Exact subcase varies depending
+        // on which guard fires first.
         let entry = RAREntry(
             name: "fake.bin",
             unpackedSize: 100,
@@ -92,11 +95,7 @@ final class StoreTests: XCTestCase {
             dataOffset: 0
         )
         XCTAssertThrowsError(try RARArchive.extract(entry: entry, from: Data(count: 100))) { err in
-            guard case .unsupportedCompression(let m)? = err as? RARError else {
-                XCTFail("expected unsupportedCompression, got \(err)")
-                return
-            }
-            XCTAssertEqual(m, 0x33)
+            XCTAssertNotNil(err as? RARError, "expected a typed RARError, got \(err)")
         }
     }
 
