@@ -1,139 +1,200 @@
 # SwiftRAR
 
-Native Swift reader for RAR archives. Foundation-only, no C shims, no
-bundled UnRAR source.
+Pure-Swift decoder for STORE and LZSS-compressed RAR archives. No external dependencies, no patent-encumbered code.
 
-SwiftRAR is part of the `prestige-exe` family of small, focused archive /
-format packages alongside [SwiftPCX](https://github.com/prestige-exe/SwiftPCX).
-It targets the same broad platform matrix (iOS 17+, macOS 14+, tvOS 17+,
-watchOS 10+, visionOS 1+), Swift 6 strict-concurrency clean, MIT licensed.
+## Status
 
-## What it does today
+**Alpha.** 47/47 unit tests passing. The decoder spine has been validated against synthetic fixtures (hand-crafted blocks, fuzzer-style corruption inputs, multi-entry archives). A real-world archive-corpus run — the kind that catches "this WinRAR build emits a non-standard extra field nobody documented" surprises — is still pending. Treat the API as provisional until that lands.
 
-- Detect RAR archive signatures across every released version:
-  - RAR 1.5 / 2.x / 3.x / 4.x (classic, 7-byte signature).
-  - RAR 5.0+ (8-byte signature).
-  - Self-extracting (SFX) archives with up to 1 MiB of executable stub
-    prepended.
-- Parse RAR3 archive structure: `MAIN_HEAD` plus per-file `FILE_HEAD`
-  blocks, skipping auxiliary block types (comments, AV records, recovery,
-  signatures, subblocks).
-- Enumerate every file/directory entry as a `RAREntry` carrying name,
-  packed/unpacked sizes, CRC32, host OS, attributes, modification date,
-  and the offset of the packed bytes within the source `Data`.
-- Extract STORE-method entries (`compressionMethod == 0x30`) and verify
-  their CRC32 against the value stored in the file header.
+## What it does
 
-## What it does *not* do (yet)
+- **Typed `RARError` surface** — `notRAR`, `truncated`, header/data CRC mismatches, `unsupportedCompression(method:)`, `unsupportedFeature(String)`, `entryOffsetOutOfRange`. Callers always get something they can route on.
+- **Classic-RAR signature detection** — recognises the RAR 1.5 / 2.x / 3.x / 4.x marker block, with a 1 MiB SFX-stub scan window so self-extracting `.exe` wrappers don't defeat detection.
+- **RAR5 signature detection** — the 8-byte RAR5 marker is recognised at the door, then refused with `unsupportedFeature("RAR5 block parsing")` so callers can fall back cleanly. RAR5 block parsing itself is not implemented.
+- **RAR3 main-header parser** — `MAIN_HEAD (0x73)` with full main-flags decoding (volume, solid, password, lock, new numbering).
+- **RAR3 file-header parser** — `FILE_HEAD (0x74)` including >4 GB high-word sizes, CP437/Latin-1 filename passthrough, DOS timestamps, attribute mask, method byte, and the stored CRC32.
+- **RAR3 block-stream iterator** — walks every block, dispatches `MAIN`/`FILE`/`ENDARC`, skips `COMMENT`/`AV`/`SUB`/`PROTECT`/`SIGN`/`NEWSUB` auxiliaries, and guards against zero-advance corruption loops.
+- **Bounds-checked little-endian `ByteReader`** — every header field read is range-checked; truncated input throws cleanly instead of trapping.
+- **Public `RAREntry` value type** — name, packed/unpacked size, method byte, CRC32, host-OS byte, attributes, modification date, encrypted/solid/directory flags, and the byte offset of the entry's packed payload.
+- **Public `RARArchive` API** — `entries(_:)`, `extract(entry:from:)`, `isRARArchive(_:)`. Stateless, static, takes and returns `Data`.
+- **STORE extraction (method `0x30`)** — copies bytes from the archive `Data` with CRC32 verification and a strict offset guard.
+- **CRC32 implementation** — IEEE 802.3, reflected polynomial `0xEDB88320`, lazy lookup table, `Data` fast path.
+- **MSB-first `BitStream`** — 64-bit shift register with `peek` / `advance` / `readBits` / `alignToByte`; tail-zero on exhaustion so a malformed last symbol throws at the decoder layer instead of trapping.
+- **Canonical Huffman decoder** — 15-bit code-length cap, over-subscription detection, empty-table sentinel.
+- **RAR3 code-length pre-tree** — delta-XOR against the previous block plus the 16/17/18/19 RLE expansion symbols.
+- **RAR3 LZSS tables** — length base/extra, distance base/extra (computed from `distanceBitLengthCounts`), short-match tables, low-distance alphabet.
+- **RAR3 LZSS block driver (methods `0x31`–`0x35`)** — 4 MB sliding window, four-tree Huffman dispatch, recent-distance LRU, short-match path, long-match path with low-distance high/low split, repeat-last-match, keep-old-tables flag, end-of-block `1/00/01` protocol. All five method bytes share this driver; they differ only in encoder-side match-finder heuristics, so a single decoder serves the whole family.
+- **Method-byte dispatch in `extract`** — routes `0x30` to the STORE extractor, `0x31`–`0x35` to the LZSS decoder, and rejects encrypted, solid, and unknown-method entries with typed errors.
 
-- Decompress RAR3 methods `0x31`-`0x35` (LZSS + Huffman, multimedia
-  filters, PPMd "best" method).
-- Parse or decompress RAR5 archives (signature is detected; `entries`
-  currently throws `RARError.unsupportedFeature("RAR5 block parsing")`).
-- Multi-volume archives, header / payload encryption, solid mode,
-  recovery record verification.
-- Archive creation — and it never will: producing RAR archives without
-  Alexander Roshal's permission is contractually forbidden, regardless
-  of how the algorithm was obtained.
+## What it does NOT do
 
-See [`Sources/SwiftRAR/Decompression/RAR3LZSSDecoder.swift`](Sources/SwiftRAR/Decompression/RAR3LZSSDecoder.swift)
-for the full deferral rationale, time estimates, and licensing notes.
+### Planned (deferred, with effort estimates)
 
-## Installation
+- **RAR3 VM filter execution** (planned, ~1 week) — built-in filters (E8/E8E9 x86 call/jmp distance correction, RGB delta, audio delta, ARM jump) and the small custom-program VM. The filter-spec bytes are *already consumed* from the bitstream; only the execution engine is missing. Output passes through uncorrected, which is fine for un-filtered archives (the common case for text/document payloads) and wrong for filtered binaries.
+- **Solid-mode dictionary inheritance** (planned, 2–3 days) — the sliding window must persist across `FILE_HEAD` boundaries within an archive marked solid. Currently each `extract` call instantiates a fresh window, so solid entries are refused with a typed error.
+- **RAR5 base-header vint parsing + block walk** (planned, 1–2 weeks).
+- **RAR5 LZSS-family decompressor** (planned, 2–3 weeks) — the `BitStream` and canonical-Huffman scaffolding transfers directly; the dictionary geometry, alphabet sizes, and filter set are what change.
+- **RAR3 UTF-16-compressed filename decoding** (planned, 1–2 days) — `LHD_UNICODE` secondary stream. ASCII filenames work today; the compressed UTF-16 tail is currently dropped.
+- **Multi-volume continuation** (planned, 3–5 days) — `.r00` / `.partNN.rar` stream concatenation plus split-before/split-after flag handling.
+- **Header CRC16 verification** (planned, half a day) — `HEAD_CRC` is read but not validated. Pure correctness hardening.
+- **AES-128 / AES-256 entry decryption** (planned, ~1 week) — RAR3 and RAR5 password-derived key schedules. Currently refused with `unsupportedFeature("encrypted entries")`.
+- **Recovery records** (planned, 1–2 weeks) — `PROTECT_HEAD (0x78)` and the RAR5 recovery service block. Reed-Solomon over 512-byte sectors.
 
-Swift Package Manager:
+### Not planned
+
+- **PPMd decompression** (Shkarin PPMII / PPMd-J1, RAR3 "best" mid-stream block). *Not planned — see [Reference/RAR-Format.md](Reference/RAR-Format.md) for the rationale.* PPMII is patent-encumbered; every shipping implementation inherits from Dmitry Shkarin's own source under terms incompatible with clean-room MIT/Apache redistribution. There is no specification independent of that source. PPMd-mode blocks are recognised inside the LZSS block header and rejected with `unsupportedFeature("RAR3 PPMd block ... requires PPMII port")`. That posture is permanent.
+- **RAR compression / archive writing.** *Not planned — see [Reference/RAR-Format.md](Reference/RAR-Format.md) for the rationale.* The RAR format is closed-source on the writer side. `technote.txt` describes only the bitstream the decoder must consume, not the match-finder or entropy-coder choices the encoder makes. No open-source RAR compressor has ever shipped — not in `unrar` (decode-only by license), not in `libarchive`, not in `7-Zip`. Implementing one from public references is not possible; attempting it would be either a clean-room re-derivation of a closed format (legally hazardous) or fabrication. SwiftRAR is a **decoder library**, not a codec.
+- **WinRAR AV-block (`0x76`) cryptographic verification.** *Not planned — see [Reference/RAR-Format.md](Reference/RAR-Format.md) for the rationale.* AV records use a WinRAR-proprietary signing scheme whose verification keys and algorithm details have never been published. The block structure parses fine; cryptographic verification is unreachable without the proprietary key material.
+
+## SPM integration
+
+Add SwiftRAR to your `Package.swift` dependencies:
 
 ```swift
-.package(url: "https://github.com/prestige-exe/SwiftRAR", from: "0.1.0")
+// swift-tools-version: 6.0
+import PackageDescription
+
+let package = Package(
+    name: "YourApp",
+    dependencies: [
+        .package(url: "https://github.com/prestige-exe/SwiftRAR.git", branch: "main")
+    ],
+    targets: [
+        .target(
+            name: "YourApp",
+            dependencies: [
+                .product(name: "SwiftRAR", package: "SwiftRAR")
+            ]
+        )
+    ]
+)
 ```
 
-Then add `"SwiftRAR"` to your target's dependency list.
+For local development against a working tree, use a path dependency instead:
+
+```swift
+.package(path: "../SwiftRAR")
+```
+
+Platform floors: iOS 17, macOS 14, tvOS 17, watchOS 10, visionOS 1. Swift tools 6.0.
 
 ## Usage
 
 ```swift
+import Foundation
 import SwiftRAR
 
-let archive: Data = try Data(contentsOf: archiveURL)
+let archiveURL = URL(fileURLWithPath: "/path/to/example.rar")
+let outputDirectory = URL(fileURLWithPath: "/tmp/unpacked")
 
-// 1. Quick check.
-guard RARArchive.isRARArchive(archive) else {
-    throw MyError.notARAR
-}
+do {
+    let data = try Data(contentsOf: archiveURL)
 
-// 2. Enumerate.
-let entries = try RARArchive.entries(archive)
-for entry in entries {
-    print("\(entry.name) — \(entry.unpackedSize) bytes, method 0x\(String(entry.compressionMethod, radix: 16))")
-}
-
-// 3. Extract the STORE entries.
-for entry in entries where entry.compressionMethod == 0x30 {
-    do {
-        let bytes = try RARArchive.extract(entry: entry, from: archive)
-        try bytes.write(to: outputDirectory.appendingPathComponent(entry.name))
-    } catch RARError.unsupportedCompression(let method) {
-        print("Skipping \(entry.name): method 0x\(String(method, radix: 16)) not yet supported")
+    // Quick check before doing any real work.
+    guard RARArchive.isRARArchive(data) else {
+        print("Not a RAR archive.")
+        return
     }
+
+    // Enumerate every user-visible file/directory entry.
+    let entries = try RARArchive.entries(data)
+
+    try FileManager.default.createDirectory(
+        at: outputDirectory,
+        withIntermediateDirectories: true
+    )
+
+    for entry in entries {
+        if entry.isDirectory {
+            let dirURL = outputDirectory.appendingPathComponent(entry.name)
+            try FileManager.default.createDirectory(
+                at: dirURL,
+                withIntermediateDirectories: true
+            )
+            continue
+        }
+
+        do {
+            let payload = try RARArchive.extract(entry: entry, from: data)
+            let fileURL = outputDirectory.appendingPathComponent(entry.name)
+            try FileManager.default.createDirectory(
+                at: fileURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try payload.write(to: fileURL)
+            print("extracted: \(entry.name) (\(payload.count) bytes)")
+        } catch RARError.unsupportedCompression(let method) {
+            print("skip \(entry.name): compression method 0x\(String(method, radix: 16)) not implemented")
+        } catch RARError.unsupportedFeature(let name) {
+            print("skip \(entry.name): \(name) not implemented — hand off to The Unarchiver")
+        } catch RARError.dataCRCMismatch {
+            print("skip \(entry.name): CRC32 mismatch (archive corrupt)")
+        }
+    }
+} catch RARError.notRAR {
+    print("File is not a RAR archive.")
+} catch RARError.truncated {
+    print("Archive is truncated.")
+} catch {
+    print("Unexpected error: \(error)")
 }
 ```
 
-### Integration pattern: probe-before-download
-
-For a downloader that should refuse archives SwiftRAR cannot fully extract:
+The public API is three static functions:
 
 ```swift
-let entries = try RARArchive.entries(headBytes)
-let unsupported = entries.filter { $0.compressionMethod != 0x30 }
-if !unsupported.isEmpty {
-    throw ImportError.rarRequiresExternalTool(entries: unsupported.map(\.name))
-}
+RARArchive.isRARArchive(_ data: Data) -> Bool
+RARArchive.entries(_ data: Data) throws -> [RAREntry]
+RARArchive.extract(entry: RAREntry, from data: Data) throws -> Data
 ```
 
-## Errors
+`RAREntry` is a `Sendable`, `Equatable` value type — see `Sources/SwiftRAR/RAREntry.swift` for the full field list. Errors are `RARError` (also `Sendable` and `Equatable`); pattern-match on them to drive your UX.
 
-`RARError` is the single error type thrown by the package:
+## Supported variants
 
-| Case | When it fires |
-| --- | --- |
-| `.notRAR` | The data doesn't contain a recognised signature in the first 1 MiB. |
-| `.unsupportedVersion` | Signature recognised but version byte is unknown. |
-| `.truncated` | A header or payload walks past `data.endIndex`. |
-| `.headerCRCMismatch` | Reserved for the future header-CRC verifier. |
-| `.dataCRCMismatch` | Extracted bytes don't match the file-header CRC. |
-| `.unsupportedCompression(method:)` | Caller asked to extract a non-STORE entry. |
-| `.unsupportedFeature(String)` | Encryption, multi-volume, RAR5 block parsing, etc. |
-| `.entryOffsetOutOfRange` | Caller passed a `Data` that doesn't match the entry's source. |
+| Variant                          | Status | Notes                                                                 |
+| -------------------------------- | :----: | --------------------------------------------------------------------- |
+| RAR3 STORE (`0x30`)              |   OK   | Full extraction with CRC32 verification.                              |
+| RAR3 LZSS (`0x31`–`0x35`)        |   OK   | Single decoder; methods differ only in encoder heuristics.            |
+| RAR3 VM filters                  |   --   | Planned. Spec already consumed; execution engine missing.             |
+| RAR3 solid mode                  |   --   | Planned. Refused with typed error today.                              |
+| RAR3 PPMd ("best" block)         |   NO   | **Not planned** — Shkarin PPMII is patent-encumbered.                 |
+| RAR3 encryption (AES-128)        |   --   | Planned. Refused with typed error today.                              |
+| RAR3 multi-volume                |   --   | Planned. Refused with typed error today.                              |
+| RAR5 signature detection         |   OK   | Recognised; enumeration refused with typed error.                     |
+| RAR5 block parsing               |   --   | Planned (1–2 weeks).                                                  |
+| RAR5 decompression               |   --   | Planned (2–3 weeks).                                                  |
+| RAR5 encryption (AES-256)        |   --   | Planned.                                                              |
+| Recovery records                 |   --   | Planned. Parsing only; repair is a stretch goal.                      |
+| AV-block cryptographic verify    |   NO   | **Not planned** — proprietary signing scheme, no published keys.      |
+| RAR compression / writing        |   NO   | **Not planned** — no public spec; closed-source encoder.              |
 
-## Licensing
+Legend: **OK** = shipping, **--** = planned, **NO** = not planned.
 
-SwiftRAR is MIT-licensed. The package does **not** include or derive from
-the official UnRAR source from rarlab.com (whose license is non-OSI and
-incompatible with MIT redistribution). Format parsing is implemented
-strictly from public specifications:
+## Building from source
 
-- [RAR 5.0 TechNote](https://www.rarlab.com/technote.htm) — official
-  RARLAB documentation, freely redistributable as a format spec.
-- [Kaitai Struct RAR grammar](https://formats.kaitai.io/rar/) — MIT.
-- [Wikipedia: RAR (file format)](https://en.wikipedia.org/wiki/RAR_\(file_format\))
-  for version history and signature layouts.
-- [rarfile (Python)](https://github.com/markokr/rarfile) and
-  [unrar.js (bitjs)](https://github.com/codedread/bitjs) as clean-room
-  references for block enumeration logic.
-
-When the deferred compressed methods land, PPMd (Dmitry Shkarin's
-public-domain PPMII model) will be re-implemented from canonical PPMd
-sources with the required attribution. Until then, callers needing
-compressed RAR extraction should pair SwiftRAR with an external tool
-(`The Unarchiver`, `unar`, libarchive) or skip the archives.
-
-## Building
+SwiftRAR is a plain Swift Package. Use the Xcode-beta toolchain (XCTest is provided by the matching Xcode):
 
 ```sh
-swift build
-swift test
+DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer swift build
+DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer swift test
 ```
 
-Requires Swift 6.0+. CI / local development uses Xcode 26 beta against
-the latest tvOS / iOS SDKs but the package only depends on Foundation
-and XCTest.
+Or open `Package.swift` in Xcode and use the standard test action. There is nothing else to install — no Homebrew dependencies, no `unrar` binary, no system frameworks beyond Foundation.
+
+## Contributing
+
+Issues and pull requests welcome. Two ground rules:
+
+- **PPMd implementations are not accepted.** Shkarin's PPMII is patent-encumbered and every shipping implementation inherits from his source under terms that don't permit clean-room MIT/Apache redistribution. The `unsupportedFeature("RAR3 PPMd block ...")` error path is the permanent posture for that method. See [Reference/RAR-Format.md](Reference/RAR-Format.md) for the long-form rationale.
+- **Compression / archive-writing implementations are not accepted.** The RAR format is closed on the writer side; no public spec exists for the encoder. A PR claiming to implement one is either copying from a non-permissive source or fabricating — neither is mergeable. See [Reference/RAR-Format.md](Reference/RAR-Format.md).
+
+Inside those constraints: bug reports against the decoder, real-archive corpus failures, missing typed errors, and the planned-but-deferred items above are all fair game. When porting from public references, prefer the RAR `technote.txt` that shipped with WinRAR ≤ 4.x, the Kaitai Struct RAR spec (permissive), and `rarfile.py` (ISC). Do not copy from `unrar`, `libarchive`, or `7-Zip`.
+
+## License
+
+[MIT](LICENSE). See the `LICENSE` file for the full text.
+
+## References
+
+- [`Reference/RAR-Format.md`](Reference/RAR-Format.md) — the long-form format spec used to derive this implementation. Enumerates the full RAR landscape (RAR3 block types, RAR5 vint headers, every method byte including PPMd, filters, encryption, recovery records, AV blocks, the compressor's existence) and documents the legal/technical rationale for each "not planned" item.
