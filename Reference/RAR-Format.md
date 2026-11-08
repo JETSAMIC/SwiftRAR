@@ -1,1312 +1,1353 @@
-# The RAR Archive Format
+# RAR Archive Format Reference
 
-A reference document covering the on-disk layout, header structures, compression
-methods, and ancillary mechanics of the RAR archive format from RAR 1.5 through
-RAR 5. The audience is implementers of decoders and tooling that needs to
-inspect or extract RAR archives. The intent is to be sober and accurate about
-what the format actually contains, what is publicly documented, and what is
-not.
+A byte-level reference for reading RAR archives: the RAR 1.5–4.x container,
+the RAR 5.0 container, the RAR 2.9 compressed bitstream used by RAR/WinRAR
+3.x and 4.x, and the checksums that protect them. It is written for
+implementers of extractors and archive inspectors.
 
-This document also closes with a precise statement of SwiftRAR's implementation
-scope: what is implemented, what is deferred (but reachable from public specs),
-and what is permanently out of scope (because the algorithm is patent-encumbered,
-the keys are proprietary, or no public specification exists at all).
+This document is the authoritative specification for SwiftRAR. Section 10
+maps every feature described here to SwiftRAR's support level, and §11
+records how the document was written (its provenance).
 
----
-
-## 1. History and scope
-
-### 1.1 Origins
-
-RAR ("Roshal Archive") was created by Eugene Roshal in 1993 and is maintained
-by him and his brother Alexander Roshal under the win.rar GmbH umbrella, which
-licenses WinRAR — the canonical encoder — for Windows and ports a command-line
-tool (`rar`) for several Unix-like platforms. From the beginning, the format
-has had two characters: WinRAR (the encoder) is closed-source, proprietary, and
-commercial; `unrar` (the decoder) ships as source under a license that permits
-inspection and compilation but explicitly forbids re-using its code to build
-a RAR-compatible compressor. This split — proprietary encoder, source-available
-decoder — has shaped every open-source RAR implementation.
-
-The format has four major on-disk generations:
-
-| Era         | Years        | Marker bytes                                    | Notes                                                                 |
-|-------------|--------------|-------------------------------------------------|-----------------------------------------------------------------------|
-| RAR 1.x     | 1993–1994    | (early — pre-`Rar!` magic)                      | LZ77-family with small windows. Rare in the wild today.               |
-| RAR 2.x     | 1996–2002    | `Rar!\x1a\x07\x00` (7 bytes)                    | Adds multimedia compression, AV records, recovery records.            |
-| RAR 3.x/4.x | 2002–2013    | `Rar!\x1a\x07\x00` (7 bytes)                    | New LZSS engine, four-tree dynamic Huffman, PPMd, VM filters, AES-128.|
-| RAR 5.x     | 2013–present | `Rar!\x1a\x07\x01\x00` (8 bytes)                | New header framing (vint sizes, BLAKE2 hashing, AES-256, 1 GB window).|
-
-This document calls the third generation "RAR3" throughout. WinRAR 4.x continued
-to ship the same on-disk format with minor extensions, so RAR3 and RAR4
-archives are read by the same parser; the distinction matters only when
-recording which WinRAR version wrote the file.
-
-### 1.2 Why the format exists
-
-RAR was designed in a world where ZIP existed but its compression (deflate)
-left ratio on the table for large or text-heavy data. Roshal's contribution
-was a careful LZSS implementation with a much larger sliding window (1 MB in
-RAR 2.x, 4 MB in RAR3, up to 1 GB in RAR5), a four-tree dynamic Huffman
-arrangement, an arithmetic-coded PPMd path for high-redundancy inputs, and
-a small bytecode-driven VM for content-aware filters (E8/E8E9 x86 call-offset
-correction, RGB delta, audio delta, ARM branch fixup). The result is a format
-that beats deflate on most realistic inputs and competes with bzip2 and 7z LZMA
-without LZMA's memory cost.
-
-The format also picked up archive-level features that ZIP added piecemeal:
-multi-volume splitting with named parts (`.r00`, `.r01`, … and later
-`.part01.rar`), per-entry encryption (AES-128 in RAR3, AES-256 in RAR5),
-optional header encryption, optional recovery records (a Reed-Solomon overlay
-for surviving sector-level damage), and solid-mode compression where the
-sliding window is shared across multiple entries in the archive.
-
-### 1.3 On-disk shape at a glance
-
-A RAR archive is a flat byte stream consisting of:
-
-1. An optional SFX (self-extracting) stub at the front — an executable that
-   knows how to find the RAR signature inside itself and extract from there.
-   Common in the wild on Windows. Decoders must scan for the signature, not
-   assume it is at offset 0.
-2. The signature bytes — `Rar!\x1a\x07\x00` (RAR3) or `Rar!\x1a\x07\x01\x00`
-   (RAR5).
-3. A sequence of blocks. Each block has a small header (its CRC, type, flags,
-   size, optional add-size for blocks that carry data) followed optionally by
-   a data payload.
-4. The first non-stub block is always the main archive header (MAIN_HEAD in
-   RAR3, type-1 main record in RAR5).
-5. File headers (FILE_HEAD in RAR3, type-2 file record in RAR5) are
-   interleaved with their compressed data payloads.
-6. The archive ends at an end-of-archive marker (ENDARC_HEAD in RAR3,
-   type-5 end record in RAR5), or at EOF if the writer omitted the marker
-   (rare but legal in RAR3).
-
-There is no central directory the way ZIP has one. To enumerate entries a
-decoder must walk the block stream from the signature forward. This is by
-design: it lets RAR be appended to (volumes, recovery records, comments) and
-still parsed.
+| | |
+|---|---|
+| Revision | 2026-11-08 |
+| Covers | RAR 1.5–4.x container (complete), RAR 5.0–7.x container (complete), RAR 2.9 LZ bitstream (complete), CRC-32 and header CRC |
+| Summarised only | RAR 1.5 / 2.0 / 5.0 bitstreams, PPMd blocks, filter programs, encryption, recovery records |
+| Language | All prose, tables and pseudocode are original to this document |
 
 ---
 
-## 2. RAR3 file structure
+## 1. Overview
 
-### 2.1 Signature
+### 1.1 What RAR is
 
-The seven-byte signature is:
+RAR ("Roshal ARchive") is a proprietary archive and compression format
+created by Eugene Roshal. Archives are written by RARLAB's own tools: the
+command-line `rar` (DOS, then Windows, Linux, macOS and FreeBSD builds),
+WinRAR for Windows, and RAR for Android. RARLAB publishes the container
+layout (a `technote.txt` file shipped with RAR up to 4.x, and an HTML
+description of the RAR 5.0 format on rarlab.com) but not the compression
+algorithms. "RAR" and "WinRAR" are trademarks of their owner; the format is
+maintained by RARLAB (win.rar GmbH).
 
-```
-Offset  Hex                  ASCII
-0x00    52 61 72 21          R a r !
-0x04    1A 07 00             . . .
-```
+Many third-party programs read RAR archives (RARLAB's own source-available
+`unrar`, 7-Zip, libarchive/bsdtar, The Unarchiver and others). Only RARLAB's
+tools create them.
 
-`0x1A` is the DOS end-of-file character (a holdover so `TYPE archive.rar` on
-DOS would stop printing at the signature); `0x07` is the bell control character;
-`0x00` is the version-major byte distinguishing RAR3 (0x00) from RAR5 (0x01).
+### 1.2 Generations
 
-When extracting a self-extracting archive, the decoder scans the first 1 MiB
-of the input for this 7-byte sequence. If found at any offset, the archive
-proper begins at that offset; everything before it is the SFX stub and is
-discarded. If not found in the first 1 MiB the file is not a RAR archive.
+The container and the compression algorithm are versioned separately. The
+container has two generations, told apart by the signature; the compression
+algorithm of each entry is identified by a version number in its header.
 
-### 2.2 Generic block header
+| Container | Signature (hex) | Written by | Compression algorithms that appear inside |
+|-----------|-----------------|------------|-------------------------------------------|
+| RAR 1.3/1.4 | `52 45 7E 5E` (`RE~^`) | RAR ≤ 1.4x (1993–1994) | RAR 1.3 (undocumented; not covered here) |
+| RAR 1.5–4.x ("classic") | `52 61 72 21 1A 07 00` | RAR 1.50 to WinRAR 4.x, and WinRAR 5+ when asked for the RAR4 format | 1.5, 2.0, 2.9 (§5.3) |
+| RAR 5.0+ | `52 61 72 21 1A 07 01 00` | WinRAR/RAR 5.0 (2013) and later | RAR 5.0 (algorithm version 0), RAR 7.0 (algorithm version 1) |
 
-Every RAR3 block, including the main archive header, file headers, sub-blocks,
-comment blocks, and the end marker, begins with the same seven-byte preamble:
+Algorithm generations inside the classic container:
 
-| Offset | Size | Field         | Meaning                                                         |
-|--------|------|---------------|-----------------------------------------------------------------|
-| 0      | 2    | HEAD_CRC      | CRC-16/IBM of all subsequent bytes of this block's header.       |
-| 2      | 1    | HEAD_TYPE     | Block type (0x72 marker, 0x73 main, 0x74 file, 0x75 comment, …) |
-| 3      | 2    | HEAD_FLAGS    | Type-specific flag bits (little-endian).                         |
-| 5      | 2    | HEAD_SIZE     | Size in bytes of this block's header (little-endian).            |
+| Algorithm | Introduced with | Main traits |
+|-----------|-----------------|-------------|
+| RAR 1.5 | RAR 1.50 | Adaptive coding with a 64 KiB window. |
+| RAR 2.0 | RAR/WinRAR 2.0 | LZ77 with per-block Huffman tables, window up to 1 MiB, an optional "multimedia" (audio prediction) mode. |
+| RAR 2.9 | WinRAR 3.00 (2002) | LZ77 with four per-block Huffman tables and a window up to 4 MiB; blocks may instead be PPMd-coded; optional preprocessing filters expressed as programs for a small virtual machine. Also used by WinRAR 4.x. |
 
-If `HEAD_FLAGS & 0x8000` is set, two additional fields follow before the
-type-specific header body:
+RAR 3.x also introduced AES-128 encryption, Unicode file names, extended
+timestamps, service sub-headers and the `name.partNN.rar` volume naming.
+RAR 5.0 replaced the container (variable-length integers, CRC-32 header
+checks, BLAKE2sp file hashes, AES-256, larger dictionaries) and the
+compression algorithm; it dropped PPMd and the virtual-machine filters in
+favour of a fixed set of built-in filters.
 
-| Offset | Size | Field         | Meaning                                                         |
-|--------|------|---------------|-----------------------------------------------------------------|
-| 7      | 4    | ADD_SIZE      | Size in bytes of the data payload that follows the header.       |
+### 1.3 File extensions, MIME type, UTI
 
-Blocks with `LHD_LARGE` (0x0100) set on a FILE_HEAD additionally have high
-words for PACK_SIZE and UNP_SIZE — see §2.4 below.
+| Item | Value |
+|------|-------|
+| Extension | `.rar`; old-style volumes `.rar`, `.r00`, `.r01`, …; new-style volumes `.part1.rar`, `.part2.rar`, …; self-extracting archives usually `.exe`; comic-book archives `.cbr` |
+| MIME type | `application/vnd.rar` (IANA registration); `application/x-rar-compressed` is the older unregistered name still in wide use |
+| Uniform Type Identifier | None is declared by Apple's system type catalogue; `com.rarlab.rar-archive` is the identifier commonly exported by third-party applications |
 
-All integers are little-endian unless explicitly noted.
+### 1.4 Telling variants apart
 
-### 2.3 Block types
-
-| HEAD_TYPE | Name           | Meaning                                                                 |
-|-----------|----------------|-------------------------------------------------------------------------|
-| 0x72      | MARK_HEAD      | The signature itself, treated as a degenerate block.                    |
-| 0x73      | MAIN_HEAD      | Main archive header. Exactly one, immediately after the signature.      |
-| 0x74      | FILE_HEAD      | File header. One per entry.                                             |
-| 0x75      | COMMENT_HEAD   | Archive comment (legacy; RAR ≥ 3.0 embeds comments in main/file flags). |
-| 0x76      | AV_HEAD        | Authenticity verification record (WinRAR-proprietary signing).          |
-| 0x77      | SUB_HEAD       | Old-style sub-block (largely superseded by NEWSUB).                     |
-| 0x78      | PROTECT_HEAD   | Recovery record (Reed-Solomon over 512-byte sectors).                   |
-| 0x79      | SIGN_HEAD      | Signature record (legacy).                                              |
-| 0x7A      | NEWSUB_HEAD    | New-style sub-block (carries metadata: extended timestamps, ACLs, etc.) |
-| 0x7B      | ENDARC_HEAD    | End-of-archive marker.                                                  |
-
-A decoder must accept and skip every type it does not consume — auxiliary
-blocks like COMMENT_HEAD, AV_HEAD, SUB_HEAD, PROTECT_HEAD, SIGN_HEAD, and
-NEWSUB_HEAD are common enough that refusing them is incorrect, but consuming
-their semantics is optional for a basic extractor.
-
-### 2.4 MAIN_HEAD (0x73)
-
-The main archive header sits immediately after the signature and carries
-archive-wide flags.
-
-| Offset | Size | Field            | Meaning                                                              |
-|--------|------|------------------|----------------------------------------------------------------------|
-| 0      | 7    | (generic header) | HEAD_CRC, HEAD_TYPE=0x73, HEAD_FLAGS, HEAD_SIZE.                     |
-| 7      | 2    | HIGH_POS_AV      | Position of AV block (legacy; usually zero).                          |
-| 9      | 4    | POS_AV           | Position of AV block (legacy; usually zero).                          |
-
-`HEAD_FLAGS` for MAIN_HEAD:
-
-| Bit    | Mask    | Name           | Meaning                                                              |
-|--------|---------|----------------|----------------------------------------------------------------------|
-| 0      | 0x0001  | MHD_VOLUME     | Archive is one volume of a multi-volume set.                          |
-| 1      | 0x0002  | MHD_COMMENT    | Old-style archive comment is present (deprecated).                    |
-| 2      | 0x0004  | MHD_LOCK       | Archive is locked (no further modification by WinRAR).                |
-| 3      | 0x0008  | MHD_SOLID      | Archive uses solid-mode compression (shared dictionary across files). |
-| 4      | 0x0010  | MHD_NEWNUMBERING | Multi-volume naming uses `.partNN.rar` (otherwise `.r00`, `.r01`).  |
-| 5      | 0x0020  | MHD_AV         | Authenticity verification information is present.                     |
-| 6      | 0x0040  | MHD_PROTECT    | Recovery record is present.                                           |
-| 7      | 0x0080  | MHD_PASSWORD   | Block headers themselves are encrypted with a password.               |
-| 8      | 0x0100  | MHD_FIRSTVOLUME| This volume is the first in a multi-volume set (RAR ≥ 3.0).           |
-
-A decoder that aims for an honest scope will reject MHD_VOLUME (without
-volume-continuation support), MHD_PASSWORD (without header encryption support),
-and report MHD_SOLID as an archive-level capability that downstream FILE_HEAD
-processing must honor.
-
-### 2.5 FILE_HEAD (0x74)
-
-The file header describes one archive entry. It is immediately followed by
-PACK_SIZE bytes of compressed (or stored) data, after which the next block
-header begins.
-
-| Offset | Size | Field            | Meaning                                                              |
-|--------|------|------------------|----------------------------------------------------------------------|
-| 0      | 7    | (generic header) | HEAD_CRC, HEAD_TYPE=0x74, HEAD_FLAGS, HEAD_SIZE.                     |
-| 7      | 4    | PACK_SIZE        | Low 32 bits of compressed payload size.                              |
-| 11     | 4    | UNP_SIZE         | Low 32 bits of uncompressed size.                                    |
-| 15     | 1    | HOST_OS          | 0=MS-DOS, 1=OS/2, 2=Win32, 3=Unix, 4=Mac OS, 5=BeOS.                 |
-| 16     | 4    | FILE_CRC         | CRC-32 of the uncompressed data (IEEE 802.3, polynomial 0xEDB88320). |
-| 20     | 4    | FTIME            | Last-modified time in MS-DOS packed format.                          |
-| 24     | 1    | UNP_VER          | Minimum unpacker version × 10 (0x1D = 2.9, 0x24 = 3.6).               |
-| 25     | 1    | METHOD           | Compression method (0x30..0x35, see §4).                             |
-| 26     | 2    | NAME_SIZE        | Length in bytes of the filename field.                                |
-| 28     | 4    | ATTR             | Host-OS file attributes.                                              |
-| 32     | 4    | HIGH_PACK_SIZE   | (Optional, LHD_LARGE) High 32 bits of compressed size.                |
-| 36     | 4    | HIGH_UNP_SIZE    | (Optional, LHD_LARGE) High 32 bits of uncompressed size.              |
-| …      | N    | FILE_NAME        | NAME_SIZE bytes; CP437/Latin-1, optionally followed by UTF-16 tail.   |
-| …      | 8    | SALT             | (Optional, LHD_SALT) Random salt for encrypted entries.               |
-| …      | 7    | EXT_TIME         | (Optional, LHD_EXTTIME) Extended (nanosecond) timestamps.             |
-
-`HEAD_FLAGS` for FILE_HEAD:
-
-| Bit    | Mask    | Name              | Meaning                                                          |
-|--------|---------|-------------------|------------------------------------------------------------------|
-| 0      | 0x0001  | LHD_SPLIT_BEFORE  | This entry's data continues from the previous volume.            |
-| 1      | 0x0002  | LHD_SPLIT_AFTER   | This entry's data continues into the next volume.                |
-| 2      | 0x0004  | LHD_PASSWORD      | Entry is encrypted.                                              |
-| 3      | 0x0008  | LHD_COMMENT       | Old-style comment is present.                                    |
-| 4      | 0x0010  | LHD_SOLID         | Entry is part of a solid stream.                                 |
-| 5..7   | 0x00E0  | LHD_WINDOW_MASK   | Dictionary size: 0=64K, 1=128K, 2=256K, 3=512K, 4=1M, 5=2M, 6=4M, 7=directory entry. |
-| 8      | 0x0100  | LHD_LARGE         | HIGH_PACK_SIZE and HIGH_UNP_SIZE are present (entries > 4 GB).    |
-| 9      | 0x0200  | LHD_UNICODE       | FILE_NAME is followed by a compressed UTF-16 representation.     |
-| 10     | 0x0400  | LHD_SALT          | SALT field is present (encrypted-entries salt for AES-128 KDF).  |
-| 11     | 0x0800  | LHD_VERSION       | Entry is a stored version (multiple-version archive).            |
-| 12     | 0x1000  | LHD_EXTTIME       | EXT_TIME field is present.                                       |
-| 13     | 0x2000  | LHD_EXTFLAGS      | Reserved.                                                        |
-
-LHD_WINDOW_MASK = 0xE0 (all three bits set, value 7) means the entry is a
-directory, not a file. The compressed data size in that case is zero.
-
-#### 2.5.1 DOS timestamp encoding
-
-`FTIME` is a 32-bit MS-DOS packed timestamp:
-
-```
-bits 31..25 = year - 1980   (0..127, so 1980..2107)
-bits 24..21 = month         (1..12)
-bits 20..16 = day           (1..31)
-bits 15..11 = hour          (0..23)
-bits 10..5  = minute        (0..59)
-bits 4..0   = second / 2    (0..29, even seconds only)
-```
-
-If LHD_EXTTIME is set, a 7-byte block follows the filename giving
-microsecond-precision mtime/ctime/atime/arctime with a small variable layout
-described in technote.txt §1.5.
-
-#### 2.5.2 Filename encoding
-
-`FILE_NAME` is `NAME_SIZE` bytes. If `LHD_UNICODE` is not set the bytes are
-the filename in CP437 (or Latin-1, depending on the writing platform — the
-distinction is not recorded in the header). If `LHD_UNICODE` is set the
-NAME_SIZE-byte field contains the ASCII filename, a single zero byte
-terminator, then a compressed UTF-16LE representation using a small
-nibble-stream RLE scheme documented in technote.txt §1.6.
-
-### 2.6 ENDARC_HEAD (0x7B)
-
-The end-of-archive marker.
-
-| Offset | Size | Field            | Meaning                                                              |
-|--------|------|------------------|----------------------------------------------------------------------|
-| 0      | 7    | (generic header) | HEAD_CRC, HEAD_TYPE=0x7B, HEAD_FLAGS, HEAD_SIZE.                     |
-| 7      | 4    | ARC_DATA_CRC     | (Optional, EARC_DATACRC) Volume-wide CRC for the data so far.        |
-| 11     | 2    | VOL_NUMBER       | (Optional, EARC_VOLNUMBER) Volume index in a multi-volume set.       |
-
-`HEAD_FLAGS` for ENDARC_HEAD:
-
-| Bit    | Mask    | Name              | Meaning                                                          |
-|--------|---------|-------------------|------------------------------------------------------------------|
-| 0      | 0x0001  | EARC_NEXT_VOLUME  | Another volume follows.                                          |
-| 1      | 0x0002  | EARC_DATACRC      | ARC_DATA_CRC field is present.                                   |
-| 2      | 0x0004  | EARC_REVSPACE     | Revision-space recovery flag.                                    |
-| 3      | 0x0008  | EARC_VOLNUMBER    | VOL_NUMBER field is present.                                     |
-
-ENDARC_HEAD is optional in RAR3: a parser that reaches end-of-file without
-seeing it must not error out. Iterators should accept EOF as an equivalent
-terminator after a successful FILE_HEAD walk.
-
-### 2.7 Auxiliary block types
-
-| HEAD_TYPE | Name           | Skip strategy                                                           |
-|-----------|----------------|-------------------------------------------------------------------------|
-| 0x75      | COMMENT_HEAD   | Skip HEAD_SIZE bytes; comment text is RAR2-compressed, mostly unused.   |
-| 0x76      | AV_HEAD        | Skip HEAD_SIZE bytes; verification is proprietary and cannot be done.   |
-| 0x77      | SUB_HEAD       | Skip HEAD_SIZE bytes plus ADD_SIZE if LONG_BLOCK flag is set.           |
-| 0x78      | PROTECT_HEAD   | Skip HEAD_SIZE + ADD_SIZE; recovery payload is not needed for decode.   |
-| 0x79      | SIGN_HEAD      | Skip HEAD_SIZE bytes.                                                   |
-| 0x7A      | NEWSUB_HEAD    | Skip HEAD_SIZE + ADD_SIZE; carries ACLs, NTFS streams, EAs — optional.  |
-
-A robust block iterator advances by `HEAD_SIZE + (LONG_BLOCK ? ADD_SIZE : 0)`
-for every block it does not specifically consume. The HEAD_SIZE field must
-itself be sanity-checked against the file length and against zero — a HEAD_SIZE
-of zero would loop a naive iterator forever, and is the canonical "corruption
-detected" condition.
+1. Search for a signature (§3.1). `RE~^` at offset 0 means RAR 1.3/1.4.
+   `Rar!\x1A\x07\x00` means the classic container, `Rar!\x1A\x07\x01\x00`
+   the RAR 5.0 container. Any other byte after `Rar!\x1A\x07` is not a known
+   RAR signature.
+2. In the classic container, each FILE_HEAD's `UNP_VER` (§3.6) names the
+   compression algorithm of that entry (§5.3). One archive may mix
+   generations.
+3. In the RAR 5.0 container, the compression-information field of each file
+   header (§4.6.1) names the algorithm version.
 
 ---
 
-## 3. RAR5 file structure
+## 2. Conventions
 
-RAR5 is a clean break from RAR3 in framing. It is decisively not a superset:
-the signature changed, the integer encoding changed, the header layout changed,
-the hash changed (from CRC-32 to BLAKE2sp for content), the cipher changed
-(AES-128 to AES-256), and the dictionary geometry changed (4 MB to up to
-1 GB).
-
-### 3.1 Signature
-
-The eight-byte RAR5 signature is:
-
-```
-Offset  Hex                     ASCII
-0x00    52 61 72 21             R a r !
-0x04    1A 07 01 00             . . . .
-```
-
-The version-major byte (offset 6) is `0x01`, distinguishing RAR5 from RAR3's
-`0x00`. The trailing byte is reserved.
-
-### 3.2 Variable-length integers (vint)
-
-RAR5 replaces RAR3's fixed-size little-endian integers with a vint encoding
-borrowed from Google's Protocol Buffers / LEB128:
-
-```
-Each byte contributes 7 bits to the integer, low-order first.
-The high bit (0x80) is a continuation flag: 1 = more bytes follow,
-0 = this is the last byte.
-
-Examples:
-  0x00                             →  0
-  0x7F                             →  127
-  0x80 0x01                        →  128   (0x80 has bit-7 continuation set,
-                                              0x01 contributes another 7 bits)
-  0xAC 0x02                        →  300   (0x2C with continuation,
-                                              then 0x02 → (2 << 7) | 0x2C)
-  0xFF 0xFF 0xFF 0xFF 0x0F         →  2^32 - 1
-```
-
-The encoding is unbounded in principle; in practice values fit in 10 bytes
-(uint64 maximum). A vint reader must:
-
-1. Refuse to consume more than 10 bytes for a single value (defends against
-   corruption that runs the continuation bit forever).
-2. Detect truncation (continuation bit on the last byte of the input).
-3. Return both the value and the number of bytes consumed, because most
-   surrounding length-prefixed fields are themselves vint-sized.
-
-### 3.3 Generic record header
-
-Every RAR5 record (a "block" in RAR3 parlance) has the shape:
-
-```
-+----+--------+--------+--------+--------+----------+----------+--------+--------+
-|CRC | hsize  | htype  | hflags | xdata  | data_sz  | header   | extra  | data   |
-| 4B | vint   | vint   | vint   | vint?  | vint?    | body     | area?  | area?  |
-+----+--------+--------+--------+--------+----------+----------+--------+--------+
-```
-
-| Field         | Encoding | Meaning                                                                                       |
-|---------------|----------|-----------------------------------------------------------------------------------------------|
-| CRC           | u32 LE   | CRC-32 of all subsequent header bytes (not including the CRC itself or any data payload).    |
-| hsize         | vint     | Total header size in bytes, excluding the 4-byte CRC and the vint(hsize) itself.              |
-| htype         | vint     | Record type. 1=main, 2=file, 3=service, 4=encryption, 5=end-of-archive.                       |
-| hflags        | vint     | Header-wide flags: extra-area present, data-area present, dependent-on-previous, etc.         |
-| xdata (size)  | vint     | If hflags & 0x0001, this is the byte length of the extra area following the header body.      |
-| data_sz       | vint     | If hflags & 0x0002, this is the byte length of the data area following the extra area.        |
-| header body   | bytes    | Type-specific fields (see §3.4–§3.6).                                                         |
-| extra area    | bytes    | Optional extended records (extended timestamps, hashes, encryption descriptors, etc.).        |
-| data area     | bytes    | Optional payload (file content for type-2/type-3 records).                                    |
-
-#### 3.3.1 Header flags (`hflags`)
-
-| Bit    | Mask   | Meaning                                                                                       |
-|--------|--------|-----------------------------------------------------------------------------------------------|
-| 0      | 0x0001 | Extra area is present and its size precedes the header body.                                  |
-| 1      | 0x0002 | Data area is present and its size precedes the header body.                                   |
-| 2      | 0x0004 | Block depends on the preceding block (e.g., solid-mode continuation).                          |
-| 3      | 0x0008 | Block must be preserved by RAR even if it cannot be parsed (forward-compatibility for writers).|
-| 4      | 0x0010 | Header contains the Data Area CRC (split blocks).                                              |
-| 5      | 0x0020 | Block is a child block (e.g., split before).                                                   |
-| 6      | 0x0040 | Block is a parent block (e.g., split after).                                                   |
-
-### 3.4 Main archive record (htype = 1)
-
-| Field         | Encoding | Meaning                                                                                       |
-|---------------|----------|-----------------------------------------------------------------------------------------------|
-| archive flags | vint     | Bits: 0x0001 = multi-volume, 0x0002 = volume number present, 0x0004 = solid, 0x0008 = recovery present, 0x0010 = locked, 0x0020 = original-volume-number unknown. |
-| volume number | vint     | (If archive flags bit 1) Index of this volume in a multi-volume set.                          |
-
-### 3.5 File record (htype = 2)
-
-| Field          | Encoding | Meaning                                                                                       |
-|----------------|----------|-----------------------------------------------------------------------------------------------|
-| file flags     | vint     | 0x0001 = directory, 0x0002 = extended time present, 0x0004 = hash present, 0x0008 = unknown unpacked size. |
-| unpacked size  | vint     | Uncompressed size (or zero if bit 3 of file flags is set).                                    |
-| attributes     | vint     | Host-OS attributes (Windows or POSIX, depending on the host-OS field below if present).        |
-| mtime          | u32 LE   | (Optional) Unix-epoch seconds.                                                                |
-| data CRC32     | u32 LE   | (Optional) CRC-32 of the uncompressed data — for back-compat with RAR3 tooling.               |
-| compression info | vint   | Packed: low 6 bits = version × 6 + algorithm, next bit = solid, next 3 bits = method (0=store, 1..5 = LZSS speeds), next 4 bits = dictionary size index. |
-| host OS        | vint     | 0 = Windows, 1 = Unix.                                                                        |
-| name length    | vint     | Length in bytes of the filename.                                                              |
-| name           | bytes    | UTF-8 filename of `name length` bytes.                                                        |
-
-Extra-area records inside the file record carry the BLAKE2sp content hash,
-extended timestamps, AES-256 encryption descriptors, NTFS ACLs, hard-link
-targets, and version annotations, each with its own type tag.
-
-### 3.6 End record (htype = 5)
-
-| Field         | Encoding | Meaning                                                                                       |
-|---------------|----------|-----------------------------------------------------------------------------------------------|
-| end flags     | vint     | 0x0001 = another volume follows.                                                              |
-
-### 3.7 Differences from RAR3 at a glance
-
-| Aspect                | RAR3                                       | RAR5                                                                  |
-|-----------------------|--------------------------------------------|-----------------------------------------------------------------------|
-| Signature length      | 7 bytes                                    | 8 bytes (high byte = 0x01)                                            |
-| Integer encoding      | Fixed LE                                   | vint (LEB128)                                                         |
-| Header CRC            | CRC-16                                     | CRC-32                                                                |
-| File content hash     | CRC-32                                     | BLAKE2sp (256-bit) — optional CRC-32 retained for back-compat         |
-| Encryption            | AES-128 with custom KDF                    | AES-256 with PBKDF2-HMAC-SHA-256                                      |
-| Maximum dictionary    | 4 MB                                       | 1 GB                                                                  |
-| Block types           | Fixed 0x72..0x7B                           | Open-ended vint htype; future types preserved via the "preserve" flag |
-| Solid mode flag       | LHD_SOLID per entry                        | Block-dependency flag (0x0004) + main-record solid flag               |
-| Filenames             | CP437 + optional compressed UTF-16 tail    | Native UTF-8                                                          |
-| Recovery records      | Reed-Solomon, fixed format                 | Reed-Solomon, redesigned to interleave with data                       |
+- **Byte order.** Every multi-byte integer is little-endian unless stated.
+- **Integer types.** `u8`, `u16`, `u32`, `u64` are unsigned integers of 8,
+  16, 32 and 64 bits. `vint` is the RAR 5.0 variable-length integer (§4.2).
+  No field is signed.
+- **Offsets** in layout tables are relative to the start of the structure
+  being described. "HEAD_SIZE bytes from the block start" includes the CRC
+  field.
+- **Bit numbering.** Bit 0 is the least significant bit of a value. Flag
+  masks are written in hexadecimal.
+- **Bit streams.** Compressed data (§6.3) is read most-significant-bit first:
+  the first bit of the stream is bit 7 of its first byte.
+- **Text.** Classic-container names are in an unspecified 8-bit code page
+  (the creating system's OEM code page on DOS/Windows, usually UTF-8 on
+  Unix), optionally accompanied by a Unicode form (§3.13). RAR 5.0 names are
+  UTF-8. No string is NUL-terminated unless stated.
+- **Alignment.** No structure is padded or aligned. Blocks follow each other
+  byte-contiguously.
+- **Terminology.** A *block* is a header plus its optional payload. An
+  *entry* is a file or directory described by a file header. The *payload*
+  (also *packed data*) is the stored or compressed bytes that follow a file
+  header. The *window* (or *dictionary*) is the history of decompressed bytes
+  that matches refer to. A *symbol* is one value decoded from a prefix code.
+- **CRC-32** means the checksum of §6.1; "CRC16" means its low 16 bits
+  (§6.2).
 
 ---
 
-## 4. Compression methods
+## 3. RAR 1.5–4.x container
 
-The method byte at offset 25 of the RAR3 FILE_HEAD (and the method nibble in
-the RAR5 file-record compression-info vint) selects the decompression
-algorithm.
+### 3.1 Physical layout and signature discovery
 
-| Method | Hex  | Name        | Description                                                                                  |
-|--------|------|-------------|----------------------------------------------------------------------------------------------|
-| Store  | 0x30 | STORE       | No compression. Raw bytes after the header. PACK_SIZE == UNP_SIZE.                           |
-| 1      | 0x31 | LZSS fast   | LZSS + four-tree dynamic Huffman + 4 MB window. Encoder optimized for speed.                 |
-| 2      | 0x32 | LZSS fast2  | Same bitstream as 0x31; encoder uses a slightly deeper match search.                         |
-| 3      | 0x33 | LZSS normal | Default WinRAR encoder setting.                                                              |
-| 4      | 0x34 | LZSS good   | Encoder uses more aggressive match-finding.                                                  |
-| 5      | 0x35 | LZSS best   | Encoder uses the deepest match-finding plus filter detection.                                |
-| 6      | 0x36 | PPMd        | Within an LZSS block stream, a PPMd subblock may carry text-heavy regions (RAR3 "best" mode).|
+An archive is: optional self-extractor (SFX) stub, the 7-byte marker, then a
+contiguous sequence of blocks. The first block after the marker must be
+MAIN_HEAD. The sequence normally ends with ENDARC_HEAD; archives written by
+RAR versions before 3.0 may end without it, at end of file.
 
-The critical observation for decoder implementers: **methods 0x31 through
-0x35 all share the exact same bitstream format**. They differ only in encoder
-heuristics. A single LZSS decoder handles all five. Method 0x36 is rare in
-the wild and is described separately in §8.
+There is no central directory: entries are found by walking blocks from the
+start.
 
-The store method (0x30) is trivial: read PACK_SIZE bytes, verify CRC32 against
-the FILE_CRC field, and emit them. There is no header inside the data payload.
+**Signature discovery.** The marker `52 61 72 21 1A 07 00` is searched for
+from the start of the file. RARLAB's documentation states that an SFX module
+never contains the marker sequence itself, so the first occurrence is the
+archive start. No maximum stub size is documented for the classic container;
+the RAR 5.0 document says RAR assumes SFX modules of at most 1 MiB, and
+readers commonly apply the same limit to both containers. Offsets inside the
+archive (for example ENDARC volume data, or MAIN_HEAD's reserved position
+fields) are not adjusted for the stub; a reader works relative to the
+marker.
+
+### 3.2 Common block header
+
+Every block begins with:
+
+| Offset | Size | Type | Name | Meaning / valid range | Notes |
+|--------|------|------|------|-----------------------|-------|
+| 0 | 2 | u16 | HEAD_CRC | CRC16 of the header (§6.2) | Fixed `0x6152` for MARK_HEAD |
+| 2 | 1 | u8 | HEAD_TYPE | Block type, §3.3 | |
+| 3 | 2 | u16 | HEAD_FLAGS | Common bits below plus type-specific bits | |
+| 5 | 2 | u16 | HEAD_SIZE | Header length in bytes, counted from offset 0, ≥ 7 | Includes every type-specific field, name and optional field |
+| 7 | 4 | u32 | ADD_SIZE | Payload length; present only if `HEAD_FLAGS & 0x8000` | In FILE_HEAD and NEWSUB_HEAD this position is PACK_SIZE |
+
+Common HEAD_FLAGS bits (valid in every block type):
+
+| Mask | Name | Meaning |
+|------|------|---------|
+| `0x4000` | SKIP_IF_UNKNOWN | An archiver that does not know this block type drops it when updating the archive; if clear it copies the block. Has no meaning for readers. |
+| `0x8000` | LONG_BLOCK | ADD_SIZE is present; the block is `HEAD_SIZE + ADD_SIZE` bytes long. Always set in FILE_HEAD. |
+
+The remaining bits (`0x0001`–`0x2000`) are type-specific. Bits not defined
+for a block type are reserved; readers ignore them.
+
+### 3.3 Block types
+
+| HEAD_TYPE | Name | Documented by | Payload length | Meaning |
+|-----------|------|---------------|----------------|---------|
+| `0x72` | MARK_HEAD | technote 1.5x–3.9x | none | The marker itself, readable as a block (§3.4) |
+| `0x73` | MAIN_HEAD | technote | ADD_SIZE if LONG_BLOCK | Archive header, §3.5 |
+| `0x74` | FILE_HEAD | technote | PACK_SIZE (+ HIGH_PACK_SIZE) | File or directory entry, §3.6 |
+| `0x75` | COMMENT_HEAD | technote 1.5x–2.x | none | Old-style comment; exists only embedded in MAIN_HEAD or FILE_HEAD, §3.8 |
+| `0x76` | AV_HEAD | technote ("old style authenticity information") | ADD_SIZE if LONG_BLOCK | Authenticity verification, RAR 2.x, §3.9 |
+| `0x77` | SUB_HEAD | technote ("old style subblock") | ADD_SIZE if LONG_BLOCK | Old-style sub-block (OS/2 extended attributes, Unix owner, …), §3.9 |
+| `0x78` | PROTECT_HEAD | technote ("old style recovery record") | ADD_SIZE if LONG_BLOCK | Recovery record, RAR 2.x, §3.9 |
+| `0x79` | SIGN_HEAD | technote ("old style authenticity information") | ADD_SIZE if LONG_BLOCK | Authenticity signature, §3.9 |
+| `0x7A` | NEWSUB_HEAD | technote ("subblock") | PACK_SIZE (+ HIGH_PACK_SIZE) | RAR 3.x service header with FILE_HEAD layout, §3.7 |
+| `0x7B` | ENDARC_HEAD | not in technote 3.93 (§9, E1) | ADD_SIZE if LONG_BLOCK | End of archive, §3.10 |
+
+Any other value is unknown. Unknown blocks are skipped by their length
+(§3.3.1); refusing them is wrong because later RAR versions may add types.
+
+#### 3.3.1 Walking the blocks
+
+```
+pos = markerOffset + 7
+read MAIN_HEAD at pos                     -- must have HEAD_TYPE 0x73
+pos = pos + MAIN_HEAD.HEAD_SIZE (+ ADD_SIZE if LONG_BLOCK)
+while pos < fileLength:
+    if fileLength - pos < 7: archive is truncated
+    read HEAD_CRC, HEAD_TYPE, HEAD_FLAGS, HEAD_SIZE at pos
+    if HEAD_SIZE < 7: header is malformed
+    if HEAD_TYPE in {0x74, 0x7A}:
+        payload = PACK_SIZE + (LHD_LARGE ? HIGH_PACK_SIZE << 32 : 0)
+    else if HEAD_FLAGS & 0x8000:
+        payload = ADD_SIZE
+    else:
+        payload = 0
+    process the block
+    if HEAD_TYPE == 0x7B: stop             -- nothing after ENDARC is read
+    pos = pos + HEAD_SIZE + payload        -- 64-bit, overflow-checked
+```
+
+FILE_HEAD and NEWSUB_HEAD are always followed by their PACK_SIZE bytes. The
+technote's processing outline uses PACK_SIZE for FILE_HEAD regardless of
+LONG_BLOCK (which RAR always sets there anyway).
+
+### 3.4 MARK_HEAD (0x72)
+
+The 7-byte marker `52 61 72 21 1A 07 00` read as a block gives HEAD_CRC
+`0x6152`, HEAD_TYPE `0x72`, HEAD_FLAGS `0x1A21`, HEAD_SIZE `0x0007`. The
+"CRC" is not a checksum; readers compare the seven bytes literally.
+
+### 3.5 MAIN_HEAD (0x73)
+
+| Offset | Size | Type | Name | Meaning | Notes |
+|--------|------|------|------|---------|-------|
+| 0 | 7 | — | common header | HEAD_TYPE = `0x73` | HEAD_SIZE is 13 in RAR 3.x/4.x archives without extras |
+| 7 | 2 | u16 | RESERVED1 | Zero; described elsewhere as the high part of the AV block position | Ignore |
+| 9 | 4 | u32 | RESERVED2 | Zero; described elsewhere as the AV block position | Ignore |
+| 13 | var | — | embedded comment | Present if MHD_COMMENT: a COMMENT_HEAD block (§3.8) | RAR ≤ 2.x only |
+| … | var | — | further fields | Later RAR versions may add bytes up to HEAD_SIZE (§3.5.1) | Ignore |
+
+MAIN_HEAD flags:
+
+| Mask | Name | Meaning | Reader action |
+|------|------|---------|---------------|
+| `0x0001` | MHD_VOLUME | Archive is one volume of a multi-volume set | Needs the other volumes for split entries |
+| `0x0002` | MHD_COMMENT | Old-style comment embedded in this header (RAR ≤ 2.x; RAR 3.x uses a NEWSUB "CMT" block instead) | Changes the HEAD_CRC span (§6.2) |
+| `0x0004` | MHD_LOCK | Archive is locked against modification | Informational |
+| `0x0008` | MHD_SOLID | Solid archive: entries may continue the previous entry's dictionary | See LHD_SOLID |
+| `0x0010` | MHD_NEWNUMBERING | RAR 3.x: volumes are named `name.partN.rar`. Technote 1.5x lists this bit as unused. | Volume naming only |
+| `0x0020` | MHD_AV | Authenticity information present (not set by RAR 3.x) | Informational |
+| `0x0040` | MHD_PROTECT | Recovery record present | Informational |
+| `0x0080` | MHD_PASSWORD | All headers after MAIN_HEAD are encrypted | Blocks cannot be walked without the password |
+| `0x0100` | MHD_FIRSTVOLUME | First volume of a set (set by RAR 3.0 and later) | Volume handling |
+| `0x0200`–`0x2000` | reserved | "reserved for internal use" | Ignore |
+
+#### 3.5.1 Extra MAIN_HEAD bytes
+
+Technote 3.93 describes MAIN_HEAD as exactly 13 bytes plus an optional
+embedded comment, but reserves the other flag bits "for internal use", and
+HEAD_SIZE governs the real length. Later RAR versions may use reserved bits
+together with additional bytes after offset 13. A reader must take the
+header length from HEAD_SIZE and ignore bytes it does not understand.
+
+### 3.6 FILE_HEAD (0x74)
+
+| Offset | Size | Type | Name | Meaning / range | Notes |
+|--------|------|------|------|-----------------|-------|
+| 0 | 7 | — | common header | HEAD_TYPE = `0x74`, LONG_BLOCK set | |
+| 7 | 4 | u32 | PACK_SIZE | Low 32 bits of the payload length | Occupies the ADD_SIZE position |
+| 11 | 4 | u32 | UNP_SIZE | Low 32 bits of the unpacked size | |
+| 15 | 1 | u8 | HOST_OS | §5.1 | Selects the meaning of ATTR and the path separator |
+| 16 | 4 | u32 | FILE_CRC | CRC-32 (§6.1) of the unpacked file | For a split entry, see §7.6 |
+| 20 | 4 | u32 | FTIME | Modification time, MS-DOS format (§3.12) | Local wall-clock time |
+| 24 | 1 | u8 | UNP_VER | Version needed to extract, `10 × major + minor` | Selects the algorithm, §5.3 |
+| 25 | 1 | u8 | METHOD | `0x30`–`0x35`, §5.2 | Compression level only |
+| 26 | 2 | u16 | NAME_SIZE | Byte length of FILE_NAME | Must fit inside HEAD_SIZE |
+| 28 | 4 | u32 | ATTR | Host attributes, §5.1 | |
+| 32 | 4 | u32 | HIGH_PACK_SIZE | High 32 bits of the payload length | Only if LHD_LARGE |
+| 36 | 4 | u32 | HIGH_UNP_SIZE | High 32 bits of the unpacked size | Only if LHD_LARGE |
+| 32 or 40 | NAME_SIZE | bytes | FILE_NAME | §3.13 | |
+| … | 8 | bytes | SALT | Encryption salt | Only if LHD_SALT |
+| … | var | — | EXT_TIME | §3.11 | Only if LHD_EXTTIME |
+| … | var | — | further fields | Up to HEAD_SIZE | Ignore |
+
+The fixed part is 32 bytes (40 with LHD_LARGE). The optional fields appear in
+the order shown. RAR ≤ 2.x placed an embedded COMMENT_HEAD (§3.8) after the
+name when LHD_COMMENT is set.
+
+FILE_HEAD flags:
+
+| Mask | Name | Meaning |
+|------|------|---------|
+| `0x0001` | LHD_SPLIT_BEFORE | Payload continues from the previous volume |
+| `0x0002` | LHD_SPLIT_AFTER | Payload continues in the next volume |
+| `0x0004` | LHD_PASSWORD | Payload is encrypted |
+| `0x0008` | LHD_COMMENT | Old-style file comment embedded after the name (not set by RAR 3.x) |
+| `0x0010` | LHD_SOLID | The entry's compressed stream continues the state left by the previous entry (RAR 2.0 and later) |
+| `0x00E0` | LHD_WINDOWMASK | 3-bit field `(flags >> 5) & 7`: dictionary `64 KiB << n` for n = 0…6; n = 7 marks a directory (RAR 2.0 and later) |
+| `0x0100` | LHD_LARGE | HIGH_PACK_SIZE and HIGH_UNP_SIZE present |
+| `0x0200` | LHD_UNICODE | FILE_NAME carries a Unicode name (§3.13) |
+| `0x0400` | LHD_SALT | SALT present |
+| `0x0800` | LHD_VERSION | Entry is an older version of a file; RAR appends `;n` to the name when displaying it |
+| `0x1000` | LHD_EXTTIME | EXT_TIME present |
+| `0x2000` | — | Not documented; reserved |
+| `0x4000` | SKIP_IF_UNKNOWN | Common bit, §3.2 |
+| `0x8000` | LONG_BLOCK | Always set |
+
+Dictionary field values:
+
+| n | Bits 7 6 5 | Dictionary |
+|---|------------|------------|
+| 0 | 000 | 64 KiB |
+| 1 | 001 | 128 KiB |
+| 2 | 010 | 256 KiB |
+| 3 | 011 | 512 KiB |
+| 4 | 100 | 1 MiB |
+| 5 | 101 | 2 MiB |
+| 6 | 110 | 4 MiB |
+| 7 | 111 | Entry is a directory |
+
+### 3.7 NEWSUB_HEAD (0x7A)
+
+RAR 3.x stores auxiliary data in service headers that reuse the FILE_HEAD
+layout of §3.6 byte for byte (PACK_SIZE, UNP_SIZE, HOST_OS, a CRC of the
+unpacked service data, UNP_VER, METHOD, NAME_SIZE, …). FILE_NAME holds the
+service name; the payload holds the service data, which may itself be
+compressed. Known names:
+
+| Name | Content |
+|------|---------|
+| `CMT` | Archive comment (RAR 3.x replacement for MHD_COMMENT) |
+| `ACL` | NTFS access-control list of the preceding file |
+| `STM` | NTFS alternate data stream of the preceding file |
+| `RR` | Recovery record |
+| others | Further names exist for host-specific metadata (owner, extended attributes, authenticity); readers that do not know a name skip the block |
+
+The four names listed are the ones RARLAB documents for RAR 5.0 service
+headers (§4.9), which continue the RAR 3.x service mechanism.
+
+A service header that describes the preceding file follows that file's
+payload. Readers that do not use a service skip it by its PACK_SIZE (§3.3.1).
+Service headers are never archive entries.
+
+### 3.8 COMMENT_HEAD (0x75), embedded
+
+Defined by technote 1.5x; RAR 3.x no longer writes it. It appears only
+inside MAIN_HEAD (at offset 13, MHD_COMMENT) or inside FILE_HEAD after the
+name (LHD_COMMENT), and its bytes are counted in the enclosing HEAD_SIZE.
+
+| Offset | Size | Type | Name | Meaning |
+|--------|------|------|------|---------|
+| 0 | 2 | u16 | HEAD_CRC | CRC16 of offsets 2 … 12 (HEAD_TYPE through COMM_CRC) |
+| 2 | 1 | u8 | HEAD_TYPE | `0x75` |
+| 3 | 2 | u16 | HEAD_FLAGS | |
+| 5 | 2 | u16 | HEAD_SIZE | 13 + length of the comment data |
+| 7 | 2 | u16 | UNP_SIZE | Unpacked comment length |
+| 9 | 1 | u8 | UNP_VER | Algorithm version of the comment data |
+| 10 | 1 | u8 | METHOD | `0x30`–`0x35` |
+| 11 | 2 | u16 | COMM_CRC | CRC16 of the unpacked comment |
+| 13 | var | bytes | COMMENT | Comment data, possibly compressed |
+
+### 3.9 Legacy blocks 0x76, 0x77, 0x78, 0x79
+
+These blocks were written by RAR 2.x for authenticity verification, old
+sub-blocks (extended attributes and similar host metadata) and recovery
+records. RAR 3.x replaced
+them with NEWSUB_HEAD services. Technote 3.93 only declares their type
+codes. Their bodies are proprietary or obsolete; a reader needs only the
+common header to skip them: `HEAD_SIZE`, plus `ADD_SIZE` when LONG_BLOCK is
+set.
+
+| HEAD_TYPE | Body | Reader action |
+|-----------|------|---------------|
+| `0x76` AV_HEAD | Opaque authenticity data inside HEAD_SIZE | Skip |
+| `0x77` SUB_HEAD | Sub-block type and data; data length in ADD_SIZE | Skip |
+| `0x78` PROTECT_HEAD | Recovery-record parameters; parity data in ADD_SIZE | Skip; repair is out of scope |
+| `0x79` SIGN_HEAD | Signature data inside HEAD_SIZE | Skip |
+
+### 3.10 ENDARC_HEAD (0x7B)
+
+| Offset | Size | Type | Name | Meaning | Notes |
+|--------|------|------|------|---------|-------|
+| 0 | 7 | — | common header | HEAD_TYPE = `0x7B` | RAR 3.x writes flags `0x4000`, HEAD_SIZE 7: bytes `C4 3D 7B 00 40 07 00` |
+| 7 | 4 | u32 | ARC_DATA_CRC | CRC-32 of the volume's data | Only if EARC_DATACRC |
+| 7 or 11 | 2 | u16 | VOL_NUMBER | Zero-based volume number | Only if EARC_VOLNUMBER |
+
+The optional fields and flags below are not described by technote 3.93; they
+are what multi-volume archives written by RAR 3.x and later carry. Only
+HEAD_SIZE is needed to read past the block.
+
+| Mask | Name | Meaning |
+|------|------|---------|
+| `0x0001` | EARC_NEXT_VOLUME | Another volume follows |
+| `0x0002` | EARC_DATACRC | ARC_DATA_CRC present |
+| `0x0004` | EARC_REVSPACE | Space reserved for a later recovery record |
+| `0x0008` | EARC_VOLNUMBER | VOL_NUMBER present |
+
+Readers stop at ENDARC_HEAD; anything after it is not part of the archive.
+
+### 3.11 EXT_TIME
+
+Present after FILE_NAME (and SALT) when LHD_EXTTIME is set. It refines the
+modification time and can add creation, last-access and archiving times.
+
+| Offset | Size | Type | Name | Meaning |
+|--------|------|------|------|---------|
+| 0 | 2 | u16 | EXT_FLAGS | Four 4-bit groups: bits 12–15 mtime, 8–11 ctime, 4–7 atime, 0–3 arctime |
+| 2 | var | — | records | One record per group whose bit 3 is set, in the order mtime, ctime, atime, arctime |
+
+Group bits:
+
+| Bit (within the 4-bit group) | Meaning |
+|------------------------------|---------|
+| 3 (`0x8`) | The time is present |
+| 2 (`0x4`) | Add one second to the DOS time (DOS times have two-second resolution) |
+| 0–1 (`0x3`) | `k` = number of sub-second bytes, 0…3 |
+
+Record layout:
+
+| Size | Field | Notes |
+|------|-------|-------|
+| 4 | DOS time (§3.12) | Absent for mtime, which uses FTIME |
+| k | Sub-second bytes | The `k` most significant bytes of a 24-bit little-endian count of 100 ns units; the missing low-order bytes are zero |
+
+Value of a present time:
+
+```
+fraction = 0
+for j in 0 ..< k:                          -- bytes in stored order
+    fraction = fraction | byte[j] << (8 * (3 - k + j))
+time = dosTime + (bit2 ? 1 s : 0) + fraction × 100 ns
+```
+
+The largest fraction is 0xFFFFFF × 100 ns ≈ 1.68 s. EXT_TIME is 2 to 26
+bytes long (flags, up to 3 mtime bytes, and three records of up to 7 bytes).
+Groups with bit 3 clear have no record. Times are local wall-clock times,
+like FTIME.
+
+### 3.12 MS-DOS date and time
+
+A 32-bit value; the high half is the date, the low half the time.
+
+| Bits | Field | Range |
+|------|-------|-------|
+| 25–31 | Year − 1980 | 0–127 (1980–2107) |
+| 21–24 | Month | 1–12 |
+| 16–20 | Day | 1–number of days in that month |
+| 11–15 | Hour | 0–23 |
+| 5–10 | Minute | 0–59 |
+| 0–4 | Second ÷ 2 | 0–29 |
+
+No time zone is stored. A value whose fields are out of range does not
+denote a time; readers should report "no time" rather than normalise it.
+
+### 3.13 File names
+
+FILE_NAME is NAME_SIZE bytes. For HOST_OS 0, 1 and 2 (MS-DOS, OS/2,
+Windows) the path separator is `\`; for Unix and other hosts it is `/` and
+`\` is an ordinary character.
+
+1. **LHD_UNICODE clear.** The bytes are in the creating system's 8-bit
+   character set, which is not recorded: typically the OEM code page
+   (CP437 and relatives) for DOS/Windows hosts, UTF-8 for Unix hosts.
+2. **LHD_UNICODE set, no zero byte in the field.** The whole field is
+   UTF-8.
+3. **LHD_UNICODE set, zero byte present.** The bytes before the first zero
+   are the 8-bit name (as in case 1); the bytes after it are a compact
+   encoding of the UTF-16 name, decoded as follows.
+
+```
+input:  oem[]   -- the 8-bit name
+        enc[]   -- bytes after the zero
+output: a sequence of UTF-16 code units
+
+high = enc[0];  i = 1;  out = []
+flagByte = 0;  flagsLeft = 0
+while i < enc.count:
+    if flagsLeft == 0:
+        flagByte = enc[i]; i += 1; flagsLeft = 4
+        if i >= enc.count: stop                 -- a flag byte with nothing after it
+    op = flagByte >> 6;  flagByte = (flagByte << 2) & 0xFF;  flagsLeft -= 1
+    switch op:
+      0: need 1 byte b:       out += b
+      1: need 1 byte b:       out += high × 256 + b
+      2: need 2 bytes lo, hi: out += hi × 256 + lo
+      3: need 1 byte n:
+           if n & 0x80:
+               need 1 byte c
+               repeat (n & 0x7F) + 2 times, while out.count < oem.count:
+                   out += high × 256 + ((oem[out.count] + c) mod 256)
+           else:
+               repeat n + 2 times, while out.count < oem.count:
+                   out += oem[out.count]
+    -- "need" stops decoding when enc has too few bytes left
+```
+
+Opcode 3 copies characters from the 8-bit name at the same position as the
+character being produced, which makes names that differ from their 8-bit
+form in only a few characters cheap to encode.
+
+Names are untrusted (§8): they may be absolute, contain `..` components or a
+drive prefix, and may contain characters that are invalid on the reading
+system.
 
 ---
 
-## 5. RAR3 LZSS bitstream details
+## 4. RAR 5.0 container
 
-The LZSS decompressor for methods 0x31..0x35 is the core of the RAR3 format.
-It is an LZSS variant with a 4 MB sliding window, four canonical Huffman
-alphabets (main, length, distance, low-distance) that are themselves
-encoded by a code-length pre-tree, recent-distance LRU, short-match table,
-repeat-last-match support, and end-of-block + filter sentinels.
+This section restates RARLAB's published "RAR 5.0 archive format"
+description in the structure of this document. It also applies to archives
+written by RAR 6.x and 7.x.
 
-### 5.1 Bit ordering
+### 4.1 Layout
 
-The LZSS bitstream is read **MSB-first**: within a byte, bit 7 is consumed
-before bit 0. This is opposite to deflate, which reads LSB-first within a
-byte. Implementers porting deflate code must remember to reverse the bit
-order.
+In order: optional SFX module; the 8-byte signature
+`52 61 72 21 1A 07 01 00`; an optional archive encryption header; the main
+archive header; an optional archive comment service header; file headers,
+each optionally followed by service headers that belong to it; an optional
+recovery record; the end of archive header. The signature is searched for
+from the start of the file over at most the maximum SFX size (currently
+1 MiB).
 
-A typical implementation maintains a 64-bit shift register and a "bits
-available" counter. When the counter drops below the largest code length
-the decoder might want to peek (15 bits for canonical Huffman, ≤ 25 for some
-literal+extra-bit reads), the implementation pulls another byte from the
-input, shifts it into the low end of the register, and increments the
-counter. When the input is exhausted, subsequent reads return zero bits —
-this lets the decoder finish the last codeword without explicit end-of-stream
-checks on every read.
+### 4.2 vint
+
+An unsigned integer stored 7 bits per byte, least significant group first.
+Bit 7 of each byte is set when another byte follows.
 
 ```
-              bit 63                                               bit 0
-              ┌─────────────────────────────────────────────────────┐
-register:     │  loaded bits, MSB-first, padded with zeros at right │
-              └─────────────────────────────────────────────────────┘
-                    ▲
-                    │ peek_bits(n): (register >> (64 - n)) & ((1 << n) - 1)
-                    │ advance(n):   register <<= n; available -= n
+value = 0; shift = 0
+repeat:
+    b = next byte
+    value = value | (b & 0x7F) << shift
+    shift += 7
+until b & 0x80 == 0
 ```
 
-### 5.2 Block structure
+At most 10 bytes encode a 64-bit value. A writer may reserve space by
+emitting `0x80` continuation bytes that contribute zero bits, so non-minimal
+encodings are legal. Examples: `00` = 0; `7F` = 127; `80 01` = 128;
+`AC 02` = 300; `80 80 00` = 0.
 
-A method-0x31..0x35 payload consists of one or more LZSS blocks. Each block
-begins with a one-bit "keep old tables" flag:
+### 4.3 General block header
 
-```
-  bit 0:  keep_old_tables  (1 = reuse the four Huffman tables from the
-                            previous block; 0 = read fresh tables now)
-```
+| Field | Type | Meaning |
+|-------|------|---------|
+| Header CRC32 | u32 | CRC-32 of everything from "Header size" through the end of the extra area |
+| Header size | vint | Bytes from "Header type" through the end of the extra area; at most 3 vint bytes (2 MiB) |
+| Header type | vint | 1 main, 2 file, 3 service, 4 archive encryption, 5 end of archive |
+| Header flags | vint | Table below |
+| Extra area size | vint | Present if flag `0x0001` |
+| Data size | vint | Present if flag `0x0002` |
+| type-specific fields | … | §4.4–§4.8 |
+| Extra area | bytes | The last "Extra area size" bytes of the header; present if `0x0001` |
+| Data area | bytes | "Data size" bytes immediately after the header; not covered by Header CRC32 or Header size |
 
-If `keep_old_tables` is 0, the decoder then reads:
+The header occupies `4 + len(Header size vint) + Header size` bytes. The next
+block starts after the data area.
 
-```
-  bit 1:  ppm_mode         (1 = this block is PPMd-coded; 0 = LZSS)
-```
+| Header flag | Meaning |
+|-------------|---------|
+| `0x0001` | Extra area present |
+| `0x0002` | Data area present |
+| `0x0004` | When updating, skip a block of unknown type that has this flag |
+| `0x0008` | Data area continues from the previous volume |
+| `0x0010` | Data area continues in the next volume |
+| `0x0020` | Block depends on the preceding file block |
+| `0x0040` | When the host block is modified, preserve this child block |
 
-If `ppm_mode` is 1, the block is RAR3's method-0x36 PPMd path (see §8).
-Decoders without PPMd support refuse the block here.
+**Extra area records.** The extra area is a sequence of records:
 
-If `ppm_mode` is 0, the decoder reads the four Huffman tables, then enters
-a symbol-decoding loop until it sees an end-of-block symbol.
+| Field | Type | Meaning |
+|-------|------|---------|
+| Size | vint | Bytes from "Type" to the end of the record |
+| Type | vint | Record type (meaning depends on the header type) |
+| Data | bytes | `Size − len(Type)` bytes; may be empty |
 
-### 5.3 Code-length pre-tree
+Unknown record types are skipped.
 
-The four Huffman tables — main (299 symbols), length (28 symbols), distance
-(60 symbols), low-distance (17 symbols) — total 404 code-length values that
-have to be transmitted at the start of every fresh table block. To compress
-this metadata, RAR3 uses a **code-length pre-tree** of 20 symbols.
+### 4.4 Archive encryption header (type 4)
 
-The pre-tree's own code lengths are sent as 20 fixed-width 4-bit values
-(80 bits total). The first value is the code length for pre-tree symbol 0,
-the second for symbol 1, and so on through symbol 19.
+| Field | Type | Meaning |
+|-------|------|---------|
+| Encryption version | vint | 0 = AES-256 (only value defined) |
+| Encryption flags | vint | `0x0001` = check value present |
+| KDF count | u8 | log2 of the PBKDF2 iteration count |
+| Salt | 16 bytes | Salt for all header keys |
+| Check value | 12 bytes | Present if `0x0001`: 8 bytes derived by extra PBKDF2 iterations plus a 4-byte checksum; lets a reader tell a wrong password from damage |
 
-Once the pre-tree is built, the decoder reads 404 symbols from it. Most of
-those symbols decode directly to a code-length value (0..15). Three symbols
-are RLE expansions:
+Every following header is preceded by a 16-byte AES-256 IV and stored
+encrypted, padded to a multiple of 16 bytes.
 
-| Pre-tree symbol | Following extra bits | Meaning                                                          |
-|-----------------|----------------------|------------------------------------------------------------------|
-| 16              | 3 bits + 3           | Repeat the previous code length (3..10 times).                   |
-| 17              | 3 bits + 3           | Insert (3..10) zero code lengths.                                |
-| 18              | 7 bits + 11          | Insert (11..138) zero code lengths.                              |
+### 4.5 Main archive header (type 1)
 
-Each decoded code length is **XOR'd with the corresponding code length from
-the previous block** ("delta XOR"). This is the mechanism by which RAR3
-exploits inter-block similarity even when full table re-use (`keep_old_tables`)
-is not selected. On the very first block of an archive, the previous-block
-code-length array is treated as all zeros.
+| Field | Type | Meaning |
+|-------|------|---------|
+| Archive flags | vint | Table below |
+| Volume number | vint | Present if `0x0002`: 1 for the second volume, 2 for the third, …; absent in the first volume |
+| Extra area | | Records below |
 
-### 5.4 The four Huffman alphabets
+| Archive flag | Meaning |
+|--------------|---------|
+| `0x0001` | Archive is a volume |
+| `0x0002` | Volume number field present (every volume but the first) |
+| `0x0004` | Solid archive |
+| `0x0008` | Recovery record present |
+| `0x0010` | Locked archive |
 
-| Alphabet     | Symbols | Purpose                                                                                  |
-|--------------|---------|------------------------------------------------------------------------------------------|
-| Main         | 299     | 0..255 literals; 256 filter spec; 257 end-of-block; 258 repeat-last-distance; 259..262 short matches; 263..298 long matches (length code carries the implicit length, distance is decoded separately from the distance alphabet). |
-| Length       | 28      | Long-match length codes for symbols 263..298 in the main alphabet — both alphabets use the same 28-entry length base/extra table.|
-| Distance     | 60      | Distance codes for long matches (and short-match high bits if applicable).               |
-| Low-distance | 17      | Low-bit refinement for long distances when the distance base/extra encoding exceeds 16 bits — encodes the bottom 4 bits of long distances as a separate Huffman code, with one symbol per nibble plus one for "this match uses the recent-distance LRU". |
+Main-header extra records:
 
-Each alphabet is canonical Huffman with a maximum code length of 15 bits.
-Codes are assigned in length-then-numerical order: shorter codes come first,
-ties broken by symbol index.
+| Type | Name | Data |
+|------|------|------|
+| `0x01` | Locator | Flags vint (`0x0001` quick-open offset present, `0x0002` recovery-record offset present); quick-open offset vint; recovery-record offset vint. Offsets are distances from the start of the main header forward to the respective block; 0 means "ignore". |
+| `0x02` | Metadata | Flags vint (`0x0001` name present, `0x0002` creation time present, `0x0004` Unix time (else Windows FILETIME), `0x0008` Unix time in nanoseconds); name length vint and UTF-8 name (truncate at the first zero; a leading zero means no name); time: 8-byte FILETIME, or 4-byte Unix seconds, or 8-byte Unix nanoseconds |
 
-### 5.5 4 MB sliding window
+### 4.6 File header (type 2) and service header (type 3)
 
-The decoder maintains a 4 MiB (4 × 1024 × 1024 = 4 194 304-byte) ring buffer.
-After every literal emit and every match copy, the window's write pointer
-advances modulo the window size. Match copies read from the window relative
-to the current write pointer: a distance of 1 means "the byte just written",
-a distance of 4 194 304 means "the byte written exactly one window ago".
+| Field | Type | Meaning |
+|-------|------|---------|
+| File flags | vint | Table below |
+| Unpacked size | vint | Size of the unpacked file or service data; ignore if `0x0008` |
+| Attributes | vint | Host attributes (file); 0 or reserved (service) |
+| mtime | u32 | Unix time in seconds; present if `0x0002` |
+| Data CRC32 | u32 | Present if `0x0004`; CRC-32 of the unpacked data, or for a non-final split part of the packed data in this volume |
+| Compression information | vint | §4.6.1 |
+| Host OS | vint | 0 Windows, 1 Unix |
+| Name length | vint | |
+| Name | bytes | UTF-8, no terminator; `/` separates path components for both hosts. For service headers, the service name (§4.9). |
+| Extra area | | §4.7 |
+| Data area | | The packed file or service data (length = header's Data size) |
 
-The window's logical width (the maximum distance the decoder will see) is
-controlled by `LHD_WINDOW_MASK` in the FILE_HEAD: values 0..6 select
-64K, 128K, 256K, 512K, 1M, 2M, 4M respectively. WinRAR ≥ 3.0 writes the
-4 MB setting (mask value 6) by default for non-tiny files.
+| File flag | Meaning |
+|-----------|---------|
+| `0x0001` | Directory (file headers only) |
+| `0x0002` | mtime field present |
+| `0x0004` | Data CRC32 field present |
+| `0x0008` | Unpacked size unknown: decompress to the end of the stream |
 
-### 5.6 Match copy semantics
+Unix names that contained bytes not convertible to Unicode store those bytes
+as U+E080…U+E0FF and include a U+FFFE marker. On Windows hosts `\` is
+invalid in names; on Unix hosts it is an ordinary character.
 
-A long match is decoded as:
+#### 4.6.1 Compression information
 
-```
-1. Read a main-alphabet symbol in the range 263..298.
-2. Subtract 263 to get a length index in 0..35.
-   Wait — the length alphabet has 28 entries, not 36. The 263..298 range
-   has 36 symbols and the length-base/extra table has 28; the mapping
-   collapses the top 8 length codes via shared extra-bit slots.
-3. Map the length index through the length base/extra table:
-      length = length_base[index] + read_bits(length_extra[index])
-4. Read a distance symbol from the distance alphabet (0..59).
-5. Map it through the distance base/extra table:
-      distance_base = distance_base[symbol]
-      extra = distance_extra[symbol]
-      if extra >= 4:
-        high = read_bits(extra - 4) shifted up by 4 bits
-        low  = read low-distance alphabet, 4 bits
-        distance = distance_base + high + low
-      else:
-        distance = distance_base + read_bits(extra)
-   distance += 1   // (RAR encodes (distance-1), so 0 → distance 1)
-6. Copy `length` bytes from window[write - distance .. write - distance + length)
-   into the output, advancing the write pointer.
-7. Push `distance` onto the recent-distance LRU (size 4).
-```
+| Mask | Field |
+|------|-------|
+| `0x0000003F` | Algorithm version: 0 = RAR 5.0, 1 = RAR 7.0; other values undefined |
+| `0x00000040` | Solid: continue the previous file's compression state (file headers only) |
+| `0x00000380` | Method `(v >> 7) & 7`: 0 = stored, 1–5 = fastest…best |
+| `0x00007C00` | `N = (v >> 10) & 0x1F`: minimum dictionary `128 KiB << N`, N = 0…23 (128 KiB…1 TiB); N > 15 requires version 1 |
+| `0x000F8000` | Version 1 only: `F = (v >> 15) & 0x1F`; dictionary += F × dictionary / 32 |
+| `0x00100000` | Version 1 only: the data is really version 0, used when version-1 files are appended to a version-0 solid stream |
 
-Short matches (main-alphabet symbols 259..262) skip the distance alphabet
-entirely and use the short-match table — see §7.3.
+### 4.7 File and service extra records
 
-### 5.7 End-of-block and table-refresh protocol
+| Type | Name | Data |
+|------|------|------|
+| `0x01` | File encryption | Version vint (0 = AES-256); flags vint (`0x0001` check value present, `0x0002` "tweaked" checksums: the CRC32 and hash depend on the key); KDF count u8 (log2 of PBKDF2 iterations); salt 16 bytes; IV 16 bytes; check value 12 bytes if `0x0001` |
+| `0x02` | File hash | Hash type vint (0 = BLAKE2sp); hash data (32 bytes for BLAKE2sp). Covers the unpacked data, or for a non-final split part the packed data in this volume |
+| `0x03` | File time | Flags vint (`0x0001` Unix time_t format, else Windows FILETIME; `0x0002` mtime, `0x0004` ctime, `0x0008` atime present; `0x0010` Unix times have nanosecond fields); then mtime, ctime, atime as u32 (Unix) or u64 (FILETIME) for each present time; then a u32 nanosecond field for each present time when `0x0001` and `0x0010` are set |
+| `0x04` | File version | Flags vint (none defined); version number vint |
+| `0x05` | Redirection | Type vint (1 Unix symlink, 2 Windows symlink, 3 Windows junction, 4 hard link, 5 file copy); flags vint (`0x0001` target is a directory); name length vint; UTF-8 target name |
+| `0x06` | Unix owner | Flags vint (`0x0001` user name, `0x0002` group name, `0x0004` numeric UID, `0x0008` numeric GID present); user name length vint + bytes; group name length vint + bytes; UID vint; GID vint (each only if flagged) |
+| `0x07` | Service data | Service-specific bytes (service headers only) |
 
-When the decoder reads main-alphabet symbol 257 (end-of-block), it reads
-the next two bits to decide what comes next:
+Windows FILETIME counts 100 ns intervals since 1601-01-01 UTC.
 
-```
-  bit 0:    1  →  end of stream
-            0  →  next block
-                  bit 1:  1  → next block reuses tables (no table re-send)
-                          0  → next block sends fresh tables (with delta-XOR)
-```
+### 4.8 End of archive header (type 5)
 
-This is RAR3's mechanism for chunking the input — every few hundred KB of
-output, the encoder closes the block, re-evaluates symbol frequencies, and
-either commits to fresh tables (delta-XOR against the previous ones) or
-keeps the existing ones for another block.
+| Field | Type | Meaning |
+|-------|------|---------|
+| End of archive flags | vint | `0x0001`: archive is a volume and not the last one |
 
-### 5.8 Filter spec symbol
+RAR reads nothing after this header; tools may append data after it.
 
-Main-alphabet symbol 256 is the filter-spec sentinel. When the decoder sees
-it, it does not emit a byte; instead it reads a small structured payload
-(see §9) that describes a VM filter program to apply to a region of output
-once it has been emitted.
+### 4.9 Service headers
+
+| Name | Placement | Content |
+|------|-----------|---------|
+| `CMT` | After the main header, before file headers | Archive comment, UTF-8, stored (method 0, packed = unpacked size) |
+| `QO` | After all file headers, before the recovery record and end header | Quick-open cache (§4.9.1) |
+| `ACL` | After its file | NTFS permissions |
+| `STM` | After its file | NTFS alternate data stream |
+| `RR` | Before the end header | Recovery record (structure not published) |
+
+#### 4.9.1 Quick-open data
+
+The stored data of the `QO` service is a sequence of cache records:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| Structure CRC32 | u32 | CRC-32 from "Structure size" to the end of the record |
+| Structure size | vint | Bytes from "Flags" to the end; at most 3 vint bytes |
+| Flags | vint | 0 |
+| Offset | vint | Distance from the start of the quick-open header to the cached data's original position; increasing through the list |
+| Data size | vint | |
+| Data | bytes | Copy of archive bytes (usually headers) at that position |
+
+A reader must use quick-open data for both listing and extraction or for
+neither; otherwise a crafted archive can list one name and extract another.
+
+### 4.10 RAR 5.0 compression
+
+The RAR 5.0 and RAR 7.0 compressed bitstreams (LZ77 with Huffman tables,
+built-in filters for x86, ARM and delta data) are not published by RARLAB and
+are not specified in this document.
 
 ---
 
-## 6. Effect and control symbols
+## 5. Enumerations
 
-The 299-symbol main alphabet is the central dispatch table. Every symbol the
-decoder reads from it either emits output, signals control, or initiates a
-match copy.
+### 5.1 HOST_OS (classic container)
 
-| Range       | Count | Semantics                                                                                  |
-|-------------|-------|--------------------------------------------------------------------------------------------|
-| 0..255      | 256   | Literal byte. Emit this byte to the window and advance the write pointer.                  |
-| 256         | 1     | Filter specification. Read a structured filter program (§9) and queue it for application.  |
-| 257         | 1     | End-of-block. Read 2 more bits to decide what comes next (§5.7).                           |
-| 258         | 1     | Repeat-last-distance. Use the most recent distance from the LRU; read length from §6.1.    |
-| 259..262    | 4     | Short matches. Length and distance both come from the short-match table (§7.3).            |
-| 263..298    | 36    | Long matches. Subtract 263, look up length in the length table (§7.1), read distance from the distance alphabet. |
+| Value | Host | ATTR meaning | Path separator |
+|-------|------|--------------|----------------|
+| 0 | MS-DOS | DOS attributes (`0x01` read-only, `0x02` hidden, `0x04` system, `0x10` directory, `0x20` archive) | `\` |
+| 1 | OS/2 | DOS attributes | `\` |
+| 2 | Win32 | Windows attributes (DOS bits plus e.g. `0x80` normal, `0x400` reparse point, `0x800` compressed) | `\` |
+| 3 | Unix | `st_mode` (file type in `0o170000`: `0o040000` directory, `0o100000` regular, `0o120000` symbolic link) | `/` |
+| 4 | Mac OS | Host-specific | `/` |
+| 5 | BeOS | Host-specific | `/` |
+| other | unknown | Uninterpreted | `/` |
 
-### 6.1 The repeat-last-distance symbol
+RAR 5.0 uses Host OS 0 (Windows attributes) and 1 (Unix `st_mode`).
 
-Symbol 258 is a one-byte optimization for runs of identical-distance matches
-(e.g., a long string of zeros where every match copies from the immediately
-preceding zero block). The decoder reads a length symbol from the **main
-alphabet** (not the length alphabet) in the range 263..298, decodes the
-length normally, and uses the distance at the head of the recent-distance LRU.
+### 5.2 METHOD (classic container)
 
-The recent-distance LRU has four slots. Symbol 258 uses slot 0. Some decoders
-generalize this with three additional repeat symbols (slot 1, slot 2, slot 3),
-but RAR3's spec uses only slot 0 for the repeat-last-distance shortcut — the
-other slots are searched implicitly when a new long-match distance happens
-to match one of them.
+| Value | Name | Payload |
+|-------|------|---------|
+| `0x30` | Store | The file bytes; `PACK_SIZE == UNP_SIZE` unless encrypted (then padded to 16 bytes) |
+| `0x31` | Fastest | Compressed with the algorithm named by UNP_VER |
+| `0x32` | Fast | 〃 |
+| `0x33` | Normal (default) | 〃 |
+| `0x34` | Good | 〃 |
+| `0x35` | Best | 〃 |
+| other | — | Undefined |
 
-### 6.2 Filter program payload (symbol 256)
+The level does not change the bitstream format; a reader dispatches on
+UNP_VER.
 
-After symbol 256 is decoded, the decoder reads:
+### 5.3 UNP_VER
+
+| Value | Algorithm | Notes |
+|-------|-----------|-------|
+| 15 | RAR 1.5 | |
+| 20 | RAR 2.0 | |
+| 26 | RAR 2.0 algorithm | Version number used for entries that need large-file support |
+| 29 | RAR 2.9 | RAR/WinRAR 3.x–4.x, §6.3 |
+| 36 | RAR 2.9 algorithm | Treated as 29; not present in the archives SwiftRAR was validated against |
+| other | unknown | Extractors report the entry as unsupported |
+
+For stored entries UNP_VER only states the minimum RAR version; the payload
+is the file itself whatever the value.
+
+### 5.4 Dictionary sizes
+
+Classic container: §3.6 table (64 KiB to 4 MiB). RAR 5.0: §4.6.1.
+
+### 5.5 Summary of type codes
+
+| Container | Field | Values |
+|-----------|-------|--------|
+| Classic | HEAD_TYPE | `0x72`–`0x7B`, §3.3 |
+| Classic | NEWSUB names | §3.7 |
+| RAR 5.0 | Header type | 1–5, §4.3 |
+| RAR 5.0 | Main extra records | 1–2, §4.5 |
+| RAR 5.0 | File/service extra records | 1–7, §4.7 |
+| RAR 5.0 | Redirection types | 1–5, §4.7 |
+| RAR 5.0 | Service names | §4.9 |
+
+---
+
+## 6. Algorithms
+
+### 6.1 CRC-32
+
+The classic container (FILE_CRC, header CRC16), RAR 5.0 headers and RAR 5.0
+data CRCs all use the same CRC:
+
+| Parameter | Value |
+|-----------|-------|
+| Width | 32 |
+| Polynomial | `0x04C11DB7` (reflected form `0xEDB88320`) |
+| Initial value | `0xFFFFFFFF` |
+| Input / output reflected | yes / yes |
+| Final XOR | `0xFFFFFFFF` |
+| Check value (`"123456789"`) | `0xCBF43926` |
+
+This is the CRC of ZIP, gzip and PNG (catalogued as CRC-32/ISO-HDLC).
 
 ```
-  filter_op_count:       8 bits unsigned  (number of operations in the program)
-  filter_data_size:    16 bits unsigned   (size of static data the program uses)
-  filter_target_size:  32 bits unsigned   (size of output region the filter
-                                            will be applied to once decoded)
-  filter_target_pos:   32 bits unsigned   (output-window offset where the
-                                            filter applies)
-  filter_program_size:  8 bits unsigned   (size in bytes of the bytecode)
-  filter_program:      filter_program_size bytes of VM bytecode
-  filter_data:         filter_data_size bytes of inline static data
+table[n] for n in 0…255:
+    c = n
+    repeat 8 times: c = (c >> 1) XOR (0xEDB88320 if c & 1 else 0)
+    table[n] = c
+
+crc32(bytes):
+    c = 0xFFFFFFFF
+    for b in bytes: c = table[(c XOR b) & 0xFF] XOR (c >> 8)
+    return c XOR 0xFFFFFFFF
 ```
 
-The exact field encoding is more compact than this pseudo-layout shows —
-the real encoding uses variable-width reads (3-bit micro-opcodes for common
-filter selectors, plus the inline-data block) — but the spirit is the same.
-See §9 for the VM details.
+### 6.2 Classic header CRC16
 
----
+HEAD_CRC is `crc32(span) & 0xFFFF`, where the span starts at HEAD_TYPE
+(offset 2) and normally ends at HEAD_SIZE (the whole header except the CRC
+field itself). The payload is never covered. Check value: `"123456789"` →
+`0x3926`. Example: ENDARC_HEAD bytes `7B 00 40 07 00` → `0x3DC4`.
 
-## 7. Static lookup tables
+| Block | Span | Source |
+|-------|------|--------|
+| MARK_HEAD | none (fixed `0x6152`) | technote |
+| MAIN_HEAD without MHD_COMMENT | offsets 2 … HEAD_SIZE−1 | technote ("HEAD_TYPE to RESERVED2"; HEAD_SIZE is 13) |
+| MAIN_HEAD with MHD_COMMENT | offsets 2 … 12 (fixed part only) | technote: the CRC covers HEAD_TYPE to RESERVED2, the embedded comment has its own CRC |
+| FILE_HEAD | offsets 2 … HEAD_SIZE−1, including SALT and EXT_TIME | technote names "HEAD_TYPE to FILEATTR and file name"; RAR 3.x archives also cover SALT and EXT_TIME (§9, E3) |
+| FILE_HEAD with LHD_COMMENT (RAR ≤ 2.x) | offsets 2 … end of FILE_NAME | technote text; the embedded comment has its own CRC |
+| NEWSUB_HEAD | as FILE_HEAD | same layout as FILE_HEAD |
+| COMMENT_HEAD | offsets 2 … 12 | technote 1.5x |
+| ENDARC_HEAD | offsets 2 … HEAD_SIZE−1 | observed in RAR 3.x archives |
+| AV_HEAD, SUB_HEAD, PROTECT_HEAD, SIGN_HEAD, unknown | not specified | — |
 
-The four Huffman alphabets share three large lookup tables whose contents
-are part of the RAR3 spec (not transmitted with each archive). These tables
-specify how main-alphabet symbols 263..298, distance-alphabet symbols 0..59,
-and the short-match index 0..7 map to (base, extra-bit-count) pairs.
+### 6.3 RAR 2.9 compressed stream
 
-### 7.1 Length table
+Used by entries with UNP_VER 29 or 36 and METHOD `0x31`–`0x35`. The payload
+of such an entry is one bit stream that produces exactly UNP_SIZE bytes.
 
-The length table has 28 entries. Each entry gives a base length and a count
-of additional bits the decoder must read from the bitstream and add to the
-base.
+#### 6.3.1 Bit input
 
-| Index | Base | Extra bits | Resulting range |
-|-------|------|------------|-----------------|
-| 0     | 3    | 0          | 3               |
-| 1     | 4    | 0          | 4               |
-| 2     | 5    | 0          | 5               |
-| 3     | 6    | 0          | 6               |
-| 4     | 7    | 0          | 7               |
-| 5     | 8    | 0          | 8               |
-| 6     | 9    | 0          | 9               |
-| 7     | 10   | 0          | 10              |
-| 8     | 11   | 1          | 11..12          |
-| 9     | 13   | 1          | 13..14          |
-| 10    | 15   | 1          | 15..16          |
-| 11    | 17   | 1          | 17..18          |
-| 12    | 19   | 2          | 19..22          |
-| 13    | 23   | 2          | 23..26          |
-| 14    | 27   | 2          | 27..30          |
-| 15    | 31   | 2          | 31..34          |
-| 16    | 35   | 3          | 35..42          |
-| 17    | 43   | 3          | 43..50          |
-| 18    | 51   | 3          | 51..58          |
-| 19    | 59   | 3          | 59..66          |
-| 20    | 67   | 4          | 67..82          |
-| 21    | 83   | 4          | 83..98          |
-| 22    | 99   | 4          | 99..114         |
-| 23    | 115  | 4          | 115..130        |
-| 24    | 131  | 5          | 131..162        |
-| 25    | 163  | 5          | 163..194        |
-| 26    | 195  | 5          | 195..226        |
-| 27    | 227  | 5          | 227..258        |
+The stream is consumed most-significant-bit first. `bits(n)` returns the
+next `n` bits as an unsigned integer whose first bit is its most significant
+bit. `align()` discards the rest of the current byte (nothing if already at
+a byte boundary). Readers need `n` up to 16.
 
-### 7.2 Distance table
+#### 6.3.2 Decoder state
 
-The distance table has 60 entries. Same structure: base distance + extra bits.
+| State | Initial value | Lifetime |
+|-------|---------------|----------|
+| output / window | empty | Entry (whole solid group in solid archives) |
+| `prevLengths[404]` | all 0 | Stream (§6.3.5) |
+| four prefix codes | none | Until the next table read |
+| `recent[0…3]` | 0, 0, 0, 0 | Stream |
+| `lastLength` | 0 | Stream |
+| `lowValue` | 0 | Stream; set to 0 by every table read |
+| `lowRepeat` | 0 | Stream; set to 0 by every table read |
+| `tablesValid` | false | Stream |
 
-| Index | Base       | Extra bits |
-|-------|------------|------------|
-| 0     | 0          | 0          |
-| 1     | 1          | 0          |
-| 2     | 2          | 0          |
-| 3     | 3          | 0          |
-| 4     | 4          | 1          |
-| 5     | 6          | 1          |
-| 6     | 8          | 2          |
-| 7     | 12         | 2          |
-| 8     | 16         | 3          |
-| 9     | 24         | 3          |
-| 10    | 32         | 4          |
-| 11    | 48         | 4          |
-| 12    | 64         | 5          |
-| 13    | 96         | 5          |
-| 14    | 128        | 6          |
-| 15    | 192        | 6          |
-| 16    | 256        | 7          |
-| 17    | 384        | 7          |
-| 18    | 512        | 8          |
-| 19    | 768        | 8          |
-| 20    | 1024       | 9          |
-| 21    | 1536       | 9          |
-| 22    | 2048       | 10         |
-| 23    | 3072       | 10         |
-| 24    | 4096       | 11         |
-| 25    | 6144       | 11         |
-| 26    | 8192       | 12         |
-| 27    | 12288      | 12         |
-| 28    | 16384      | 13         |
-| 29    | 24576      | 13         |
-| 30    | 32768      | 14         |
-| 31    | 49152      | 14         |
-| 32    | 65536      | 15         |
-| 33    | 98304      | 15         |
-| 34    | 131072     | 16         |
-| 35    | 196608     | 16         |
-| 36    | 262144     | 18         |
-| 37    | 327680     | 18         |
-| 38    | 393216     | 18         |
-| 39    | 458752     | 18         |
-| 40    | 524288     | 18         |
-| 41    | 589824     | 18         |
-| 42    | 655360     | 18         |
-| 43    | 720896     | 18         |
-| 44    | 786432     | 18         |
-| 45    | 851968     | 18         |
-| 46    | 917504     | 18         |
-| 47    | 983040     | 18         |
-| 48    | 1048576    | 18         |
-| 49    | 1114112    | 18         |
-| 50    | 1179648    | 18         |
-| 51    | 1245184    | 18         |
-| 52    | 1310720    | 18         |
-| 53    | 1376256    | 18         |
-| 54    | 1441792    | 18         |
-| 55    | 1507328    | 18         |
-| 56    | 1572864    | 18         |
-| 57    | 1638400    | 18         |
-| 58    | 1703936    | 18         |
-| 59    | 1769472    | 18         |
+"Stream" means: reset when a non-solid entry starts, kept across entries of a
+solid group (§6.3.11).
 
-The repetitive top of the table (indices 36..59 all carrying 18 extra bits)
-reflects the fact that distances above 256 KB are uncommon enough that
-WinRAR can afford to allocate them a coarse Huffman index and recover
-precision from the 18 extra bits. For distances where extra bits ≥ 4, the
-extra-bit value is decoded in two pieces: the high bits as raw bitstream
-reads, and the low 4 bits as a code from the low-distance alphabet (§7.4).
-That split makes the low bits cheaper to encode when they cluster around a
-small set of values (common for binary-aligned data).
+#### 6.3.3 Block header
 
-The distance-table construction in source can be derived from a compact
-nine-element seed array `distanceBitLengthCounts = [4, 4, 4, 4, 4, 4, 4, 4,
-4, 4, 4, 4, 12, 14, 16, 24]` (a per-segment count of how many indices share
-the same extra-bit width); SwiftRAR computes the table from that seed at
-load time.
-
-### 7.3 Short-match table
-
-The short-match table has 8 entries. Short matches (main-alphabet symbols
-259..262, plus the implicit short-match alphabet) skip the regular length
-and distance alphabets entirely.
-
-| Index | Base distance | Extra bits |
-|-------|---------------|------------|
-| 0     | 0             | 0          |
-| 1     | 4             | 0          |
-| 2     | 8             | 0          |
-| 3     | 16            | 1          |
-| 4     | 32            | 2          |
-| 5     | 64            | 3          |
-| 6     | 128           | 4          |
-| 7     | 192           | 5          |
-
-A short match's length is one of {2, 3, 4, 5} and is determined by which of
-the four short-match symbols (259..262) was read from the main alphabet.
-The short-match table is consulted only for the **distance** portion. The
-short-match path exists because two- and three-byte matches at small
-distances are extremely common in compressed text and binary, and a
-dedicated coding path saves several bits per occurrence over routing them
-through the long-match machinery.
-
-### 7.4 Low-distance alphabet
-
-The low-distance alphabet has 17 symbols. Symbols 0..15 each represent a
-specific value for the low 4 bits of a distance (i.e., symbol 5 means "the
-low 4 bits of this distance are 0b0101"). Symbol 16 is the
-"use-recent-distance-LRU" sentinel: when read in the context of a long
-match whose distance has extra bits ≥ 4, it means "don't take the high
-bits from the bitstream; instead reuse a distance from the recent-distance
-LRU". The exact LRU slot is determined by the high bits that would otherwise
-have been read (the encoding uses 0, 1, or 2 additional bits to select the
-LRU slot when symbol 16 is taken).
-
-The low-distance alphabet is the smallest of the four Huffman codes (only
-17 symbols, max 15 bits per code) but it appears in the bitstream on every
-long-distance match, so its compactness matters for overall ratio.
-
----
-
-## 8. PPMd subblock (method 0x36)
-
-RAR3's "best" compression mode (method byte 0x36) can mix LZSS blocks with
-PPMd-coded blocks. The PPMd block is selected by the `ppm_mode` bit in the
-block header (§5.2). When it is set, the rest of the block is not LZSS at
-all — it is a PPMd-coded byte stream that emits directly into the output
-(no Huffman, no sliding window, no filters — PPMd is its own world).
-
-### 8.1 What PPMd is
-
-PPMd (Prediction by Partial Matching, variant d) is a context-mixing
-compression algorithm by Dmitry Shkarin, based on Cleary and Witten's
-original PPM and Moffat's PPMC. It maintains a Markov model of variable
-order: for each output byte, it conditions its probability estimate on a
-context of up to N preceding bytes (the "order"), falling back to a
-shorter context when the longer one has not been seen before. PPMII
-("Information Inheritance") is Shkarin's specific variant that propagates
-escape-probability and statistics from longer contexts down to shorter
-ones, giving better ratios at the cost of significantly more memory and
-arithmetic per byte.
-
-The encoded byte stream is an **arithmetic-coded** sequence of probability
-updates and symbol emissions. There is no Huffman decoder here at all;
-arithmetic coding maintains an interval [low, high) over a 32-bit range
-and refines it bit-by-bit toward a single point that corresponds to the
-encoded message.
-
-RAR3's PPMd block carries:
-
-1. A model-reset signal at the start (whether to inherit state from the
-   previous PPMd block or start fresh).
-2. The arithmetic-coded byte stream itself.
-3. An escape sequence (the byte 0x02 from the model output) signals
-   end-of-stream and switches the decoder back into LZSS-block mode for
-   subsequent blocks within the same method-0x36 file.
-
-### 8.2 Patent encumbrance
-
-PPMII / PPMd-J1 as implemented by Shkarin has historically been encumbered
-by patent and proprietary-license claims. Every shipping implementation —
-7-Zip, unrar, libarchive — inherits from Shkarin's own source code under
-terms that do **not** permit clean-room MIT/Apache redistribution. There
-is no specification document independent of that source: the algorithm
-is the source.
-
-For an MIT/Apache-licensed Swift library, this means the PPMd path is
-permanently out of scope. SwiftRAR detects the `ppm_mode` bit in the
-block header, refuses with `RARError.unsupportedFeature(...)`, and is
-explicit in its README that PPMd archives must be routed to a tool that
-inherits from the unrar lineage (The Unarchiver on macOS, 7-Zip elsewhere).
-
-Implementers building under permissive licenses should not attempt PPMd —
-the legal exposure is real and the algorithmic description in compression
-textbooks is insufficient to clean-room a compatible implementation. The
-RAR3 PPMd block format itself is documented in technote.txt; the **arithmetic
-coder and model** that interpret it are not.
-
----
-
-## 9. Multimedia filters and the RAR VM
-
-The filter spec (main-alphabet symbol 256) is RAR3's mechanism for applying
-content-aware post-processing to decoded output. Filters do not change the
-compressed bitstream; they run after a region of output has been emitted,
-correcting it in place to undo a transform the encoder applied to make
-the data more LZSS-compressible.
-
-### 9.1 The five built-in filters
-
-The five filters that ship with WinRAR's encoder are:
-
-| Filter            | Operates on                          | Transformation                                                                                          |
-|-------------------|--------------------------------------|---------------------------------------------------------------------------------------------------------|
-| E8                | x86 executables                      | Replace absolute call/jmp targets (0xE8/0xE9 opcode) with relative offsets so identical calls collapse. |
-| E8/E9             | x86 executables (E8 + E9 variant)    | Same as E8 but extends to E9 (unconditional jmp) instructions.                                          |
-| Itanium           | IA-64 executables                    | Apply equivalent call-target normalization for Itanium branch bundles.                                  |
-| RGB delta         | 24-bit BMP or similar RGB streams    | Delta-encode each color channel against the same channel in the previous pixel.                         |
-| Audio delta       | 16-bit PCM audio                     | Delta-encode each sample against the previous sample on the same channel.                               |
-| ARM branch        | 32-bit ARM executables               | Normalize the offset of B/BL branch instructions to a canonical form.                                   |
-
-The encoder runs a small classifier over its input window and inserts a
-filter-spec symbol when it sees a region whose statistics match one of
-these predefined filters. The decoded LZSS output for that region is the
-**transformed** form (e.g., all x86 call targets normalized to zero-relative);
-the filter, when applied at output time, reverses the transformation and
-restores the original bytes.
-
-### 9.2 The RAR VM
-
-In addition to the five built-in filters, RAR3 ships a small bytecode VM
-that can execute arbitrary filter programs delivered inline in the
-compressed stream. The VM has:
-
-- 8 general-purpose registers (`r0..r7`), 32-bit each.
-- A flags register (zero, sign, carry — like an x86 EFLAGS).
-- A small memory area (the size matches the filter's `target_size`).
-- An instruction set of roughly 40 opcodes: mov, add, sub, jz/jnz/js/jc,
-  cmp, test, shl/shr, and/or/xor, push/pop, call/ret, and a few
-  specialized ones (sar — arithmetic shift right, neg, not, inc, dec,
-  mul, div).
-- Addressing modes: register, memory at register, memory at immediate,
-  immediate constant.
-
-The VM is little-endian, byte-addressable for memory operations, and has
-no I/O — it operates strictly on the filter's input buffer (the output
-region the filter is being applied to) plus the filter's static data
-block. Programs return by emitting a `ret` instruction that pops a target
-address off the stack (initialized at program start to point at the end of
-the buffer); when the program counter reaches that address, the filter is
-done.
-
-In practice the inline VM is rare. The built-in filters cover the vast
-majority of multimedia and executable data, and WinRAR's encoder uses
-custom VM programs only when an explicit profile is loaded. Reachable
-implementations like `rarfile.py` and the Kaitai Struct RAR spec document
-the bytecode and most decoders implement at least the five built-in
-filters with hand-written code, deferring full VM execution to whenever an
-archive actually requires it.
-
-### 9.3 Filter execution order
-
-Within a single LZSS block, multiple filter specs can be in flight at once
-(symbol 256 is read but the filter does not execute until enough output has
-been produced to cover its target region). The decoder maintains a queue:
-
-1. When symbol 256 is decoded, parse the spec and push a record onto the
-   queue: (target_pos, target_size, program_id, static_data).
-2. Continue decoding literals and matches into the output window.
-3. After each byte (or each match copy) is emitted, check whether the
-   head of the queue's `target_pos + target_size` has now been reached.
-4. If so, dequeue the record and run the filter over the corresponding
-   output bytes in place. The filter's output replaces those bytes in
-   the window — subsequent matches that reference distances into the
-   filtered region see the filter's output, not the pre-filter bytes.
-
-### 9.4 SwiftRAR status
-
-SwiftRAR currently consumes the filter spec bytes from the bitstream (so
-the decoder stays in sync with the rest of the LZSS state machine) but
-**does not execute** the filter program. For unfiltered archives (the
-overwhelming majority of textmode-era RAR files in the audit's target
-corpus), the output is correct. For archives whose encoder inserted
-filters (typically x86 binaries, BMPs, PCM audio), the output will differ
-from the original input — generally the bytes immediately after a filter
-spec will look like normalized call targets rather than absolute addresses.
-
-VM filter execution is a tracked deferred feature; the spec is public
-(technote.txt + rarfile.py + Kaitai Struct RAR cover the bytecode and the
-five built-in filters), and the effort estimate is roughly one focused
-week.
-
----
-
-## 10. Solid mode
-
-Solid mode is RAR's term for compressing multiple file entries against a
-**shared sliding window**, so that match references inside file N can
-reach back into the decoded output of files 0..N-1. The compression ratio
-gain is substantial when an archive contains many small similar files
-(e.g., a directory of source code or a set of similarly-laid-out
-configuration files).
-
-### 10.1 How it works on disk
-
-When MHD_SOLID (0x0008) is set in the main archive header, every FILE_HEAD
-that has LHD_SOLID (0x0010) set is encoded against the dictionary state
-left over from the **end of the previous solid entry's decoded output**.
-The decoder must:
-
-1. Initialize the 4 MB sliding window once, at the start of the archive.
-2. For each FILE_HEAD with LHD_SOLID set, decode its data into the same
-   window — do not reset the window, do not reset the recent-distance LRU,
-   do not reset the Huffman tables (the keep_old_tables flag at the start
-   of the first block of the new entry decides whether to reuse the tables
-   from the end of the previous entry).
-3. For each FILE_HEAD without LHD_SOLID set in a MHD_SOLID archive, reset
-   the dictionary at that entry's boundary. (Some archives mix solid and
-   non-solid entries; this is rare but legal.)
-4. CRC32 verification still happens per-entry over each entry's
-   uncompressed output.
-
-### 10.2 Why random access is impossible
-
-In a non-solid archive, a decoder can seek to the FILE_HEAD of any entry
-and extract it without touching the others — each entry's compressed
-stream is self-contained. In a solid archive, every entry's compressed
-stream **depends on the decoded output of all previous solid entries**.
-Extracting the third file out of a hundred requires decompressing the
-first two as well. This is the price of the ratio improvement, and it
-is why archive software typically warns the user when they request to
-extract a single file from a solid archive (the operation is correct but
-slow).
-
-### 10.3 SwiftRAR status
-
-SwiftRAR currently rejects MHD_SOLID archives at iteration time with
-`RARError.unsupportedFeature("solid mode")`. The implementation is a
-tracked deferred feature with an effort estimate of 2-3 days: the
-current decoder instantiates a fresh window per entry, and the fix is to
-hold a per-archive decoder instance across iterator advances and only
-reset its state when an entry without LHD_SOLID appears. The bounds of
-the change are well-contained; the spec is fully public.
-
----
-
-## 11. CRC32 and recovery records
-
-### 11.1 CRC32 for entry payloads
-
-RAR3 uses the IEEE 802.3 CRC-32, identical to the one used by Ethernet,
-ZIP, gzip, and PNG. The reflected polynomial is `0xEDB88320`. Each
-FILE_HEAD carries a 32-bit `FILE_CRC` field giving the CRC of the
-**uncompressed** data. After decompressing an entry, the decoder must
-compute the CRC over its output and compare; a mismatch indicates either
-data corruption or a decoder bug.
-
-A reference table-driven implementation:
+Whenever tables are needed (`tablesValid` false at the start of an entry, or
+after an end-of-block marker that requests them) the decoder reads a block
+header:
 
 ```
-crc_table[256]:
-  for i in 0..255:
-    c = i
-    for j in 0..7:
-      if c & 1:
-        c = (c >> 1) ^ 0xEDB88320
-      else:
-        c = c >> 1
-    crc_table[i] = c
-
-crc32(data):
-  crc = 0xFFFFFFFF
-  for byte in data:
-    crc = (crc >> 8) ^ crc_table[(crc ^ byte) & 0xFF]
-  return crc ^ 0xFFFFFFFF
+align()
+if bits(1) == 1: this is a PPMd block (§6.3.10)
+keep = bits(1)
+if keep == 0: prevLengths = all 0
+read the tables (§6.3.5)
+lowValue = 0; lowRepeat = 0
+tablesValid = true
 ```
 
-The table can be computed lazily and cached; SwiftRAR builds it once and
-exposes a `Data`-fast-path `CRC32.compute(data)` API.
+#### 6.3.4 Prefix codes
 
-### 11.2 Header CRC16
+Every alphabet is coded with a canonical prefix code defined only by a code
+length per symbol (0 = unused, 1…15 = length in bits):
 
-Each RAR3 block carries a `HEAD_CRC` field in its first two bytes. This is
-a CRC-16/IBM (polynomial `0xA001` reflected). Strict decoders validate
-HEAD_CRC against the bytes from HEAD_TYPE through the end of the header;
-lenient decoders skip the check. SwiftRAR currently reads HEAD_CRC but
-does not validate it; the validation is a tracked deferred item (half a
-day of work).
+1. Count the symbols of each length 1…15.
+2. Codes of length `L` start at `first[L] = (first[L−1] + count[L−1]) << 1`
+   with `first[1] = 0` and `count[0] = 0`.
+3. Within one length, symbols receive consecutive codes in increasing symbol
+   order.
 
-### 11.3 Recovery records
+This is the same assignment DEFLATE uses (RFC 1951 §3.2.2). Codes are read
+most-significant-bit first, one bit at a time conceptually:
 
-RAR's recovery records are a Reed-Solomon encoding overlaid on the archive
-at 512-byte sector granularity. The PROTECT_HEAD (0x78) block in RAR3 and
-the equivalent service record in RAR5 carries the Reed-Solomon parity bytes
-plus an index telling the decoder which sectors of the archive they
-correspond to. If a few sectors of the archive are damaged (bad media,
-truncated download), the recovery payload can reconstruct them.
+```
+code = 0; first = 0; index = 0
+for L in 1…15:
+    code = code | bits(1)
+    if code − first < count[L]: return sortedSymbols[index + code − first]
+    index += count[L]; first = (first + count[L]) << 1; code = code << 1
+the bits do not form a code → the stream is corrupt
+```
 
-The Reed-Solomon code itself is over GF(256) with a fixed primitive
-polynomial; the specific parameters are documented in technote.txt. SwiftRAR
-parses PROTECT_HEAD as an opaque block (skipped during iteration) but does
-not perform repair — recovery is a tracked deferred item for a much later
-phase.
+`sortedSymbols` lists the used symbols ordered by (length, symbol). A code
+may be incomplete (the Kraft sum is below 1): real encoders produce such
+codes, and only bit patterns outside the code are errors. A code whose Kraft
+sum exceeds 1 is invalid.
+
+#### 6.3.5 Table transmission
+
+**Pre-code.** Twenty 4-bit values give the code lengths of the 20-symbol
+pre-code alphabet:
+
+```
+i = 0
+while i < 20:
+    v = bits(4)
+    if v == 15:
+        z = bits(4)
+        if z == 0: preLength[i] = 15; i += 1
+        else: set min(z + 2, 20 − i) entries starting at i to 0; advance i past them
+    else:
+        preLength[i] = v; i += 1
+```
+
+**Main lengths.** The pre-code then yields 404 code lengths, for the four
+alphabets in the order of §6.3.6:
+
+```
+i = 0
+while i < 404:
+    s = decode with the pre-code
+    if s <= 15:
+        lengths[i] = (s + prevLengths[i]) & 15; i += 1
+    else if s == 16 or s == 17:
+        n = (s == 16) ? bits(3) + 3 : bits(7) + 11
+        if i == 0: corrupt                       -- nothing to repeat
+        repeat n times while i < 404: lengths[i] = lengths[i − 1]; i += 1
+    else:                                        -- 18 or 19
+        n = (s == 18) ? bits(3) + 3 : bits(7) + 11
+        repeat n times while i < 404: lengths[i] = 0; i += 1
+prevLengths = lengths
+```
+
+Runs that would pass 404 are cut at 404. Delta coding (`s + prevLengths[i]`)
+only matters when the keep bit was set; otherwise `prevLengths` is zero.
+
+#### 6.3.6 Alphabets
+
+| Order | Name | Size | Range within the 404 lengths | Purpose |
+|-------|------|------|------------------------------|---------|
+| 1 | main | 299 | 0–298 | Literals, matches, control symbols |
+| 2 | distance slot | 60 | 299–358 | Slot of a new match distance |
+| 3 | low distance | 17 | 359–375 | Low 4 bits of large distances, or "repeat" |
+| 4 | length | 28 | 376–403 | Length code after a recent-distance symbol |
+
+Main alphabet:
+
+| Symbol | Meaning |
+|--------|---------|
+| 0–255 | Literal byte |
+| 256 | End of block (§6.3.8) |
+| 257 | Filter record (§6.3.9) |
+| 258 | Repeat the previous match |
+| 259–262 | Match at `recent[symbol − 259]`, length from the length alphabet |
+| 263–270 | Two-byte match at a short distance |
+| 271–298 | Match with an explicit distance, length code `symbol − 271` |
+
+#### 6.3.7 Static tables
+
+Length codes (used by symbols 259–262 via the length alphabet and by
+271–298). `base` and `extra` give the length contribution and the number of
+raw bits that follow:
+
+| Code | base | extra | | Code | base | extra |
+|------|------|-------|-|------|------|-------|
+| 0 | 0 | 0 | | 14 | 24 | 2 |
+| 1 | 1 | 0 | | 15 | 28 | 2 |
+| 2 | 2 | 0 | | 16 | 32 | 3 |
+| 3 | 3 | 0 | | 17 | 40 | 3 |
+| 4 | 4 | 0 | | 18 | 48 | 3 |
+| 5 | 5 | 0 | | 19 | 56 | 3 |
+| 6 | 6 | 0 | | 20 | 64 | 4 |
+| 7 | 7 | 0 | | 21 | 80 | 4 |
+| 8 | 8 | 1 | | 22 | 96 | 4 |
+| 9 | 10 | 1 | | 23 | 112 | 4 |
+| 10 | 12 | 1 | | 24 | 128 | 5 |
+| 11 | 14 | 1 | | 25 | 160 | 5 |
+| 12 | 16 | 2 | | 26 | 192 | 5 |
+| 13 | 20 | 2 | | 27 | 224 | 5 |
+
+Codes 0–7 have no extra bits; from code 8 on, every group of four codes
+doubles the step. The largest coded value is 224 + 31 = 255.
+
+Distance slots: 60 slots, each with a base and a number of extra bits. They
+are generated from the number of slots per extra-bit count:
+
+```
+slotsPerExtra = [4, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 14, 0, 12]
+                -- index = number of extra bits (0 … 18)
+base = 0; slot = 0
+for extra in 0…18:
+    repeat slotsPerExtra[extra] times:
+        slotBase[slot] = base; slotExtra[slot] = extra
+        base += 1 << extra; slot += 1
+```
+
+| Slots | extra | First base | Step |
+|-------|-------|------------|------|
+| 0–3 | 0 | 0 | 1 |
+| 4–5 | 1 | 4 | 2 |
+| 6–7 | 2 | 8 | 4 |
+| 8–9 | 3 | 16 | 8 |
+| 10–11 | 4 | 32 | 16 |
+| 12–13 | 5 | 64 | 32 |
+| 14–15 | 6 | 128 | 64 |
+| 16–17 | 7 | 256 | 128 |
+| 18–19 | 8 | 512 | 256 |
+| 20–21 | 9 | 1 024 | 512 |
+| 22–23 | 10 | 2 048 | 1 024 |
+| 24–25 | 11 | 4 096 | 2 048 |
+| 26–27 | 12 | 8 192 | 4 096 |
+| 28–29 | 13 | 16 384 | 8 192 |
+| 30–31 | 14 | 32 768 | 16 384 |
+| 32–33 | 15 | 65 536 | 32 768 |
+| 34–47 | 16 | 131 072 | 65 536 |
+| 48–59 | 18 | 1 048 576 | 262 144 |
+
+The last slot ends at 4 194 304 = 4 MiB, the largest window.
+
+Short distances (symbols 263–270, index `k = symbol − 263`):
+
+| k | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+|---|---|---|---|---|---|---|---|---|
+| base | 0 | 4 | 8 | 16 | 32 | 64 | 128 | 192 |
+| extra | 2 | 2 | 3 | 4 | 5 | 6 | 6 | 6 |
+
+Together they cover distances 1…256.
+
+#### 6.3.8 Decoding loop
+
+All distances below are "bytes back from the next output position" and are at
+least 1. `copy(length, distance)` appends `length` bytes, each equal to the
+byte `distance` positions before it; when `distance < length` the copy
+overlaps itself and repeats a pattern, so it must proceed byte by byte (or
+equivalently).
+
+```
+push(d):  recent[3] = recent[2]; recent[2] = recent[1]; recent[1] = recent[0]; recent[0] = d
+
+while output.count < UNP_SIZE:
+    if not tablesValid: read a block header (§6.3.3)
+    s = decode(main)
+
+    if s < 256:
+        append byte s
+
+    else if s >= 271:                                   -- explicit match
+        c = s − 271
+        length = lengthBase[c] + 3 + bits(lengthExtra[c])
+        slot = decode(distance slot)
+        d = slotBase[slot] + 1
+        e = slotExtra[slot]
+        if e > 0 and slot <= 9:
+            d += bits(e)
+        else if e > 0:                                  -- slots 10…59, e >= 4
+            if e > 4: d += bits(e − 4) << 4
+            if lowRepeat > 0:
+                lowRepeat −= 1; d += lowValue
+            else:
+                v = decode(low distance)
+                if v == 16: lowRepeat = 15; d += lowValue
+                else:       lowValue = v; d += v
+        if d >= 0x2000:  length += 1
+        if d >= 0x40000: length += 1
+        push(d); lastLength = length
+        copy(length, d)
+
+    else if s == 256:                                   -- end of block, §6.3.8.1
+        ...
+
+    else if s == 257:                                   -- filter record, §6.3.9
+        ...
+
+    else if s == 258:                                   -- repeat previous match
+        if lastLength != 0: copy(lastLength, recent[0])
+
+    else if s <= 262:                                   -- recent distance
+        k = s − 259
+        d = recent[k]
+        move recent[k] to the front: recent[k..1] = recent[k−1..0]; recent[0] = d
+        c = decode(length)
+        length = lengthBase[c] + 2 + bits(lengthExtra[c])
+        lastLength = length
+        copy(length, d)
+
+    else:                                               -- 263…270, short match
+        k = s − 263
+        d = shortBase[k] + 1 + bits(shortExtra[k])
+        push(d); lastLength = 2
+        copy(2, d)
+```
+
+Notes:
+
+- The bonus `+1`/`+2` for distances ≥ `0x2000` and ≥ `0x40000` applies only
+  to explicit matches (271–298). Recent-distance matches (259–262) and the
+  repeat symbol (258) carry no bonus.
+- `push` does not remove an existing copy of `d`; the history may hold
+  duplicates. Only symbols 259–262 move an entry to the front.
+- Explicit-match lengths therefore range from 3 to 260, recent-distance
+  lengths from 2 to 257, short matches are always 2.
+- A recent-distance symbol whose history slot is still 0, or any distance
+  larger than the bytes produced so far for the stream, is corrupt in a
+  non-solid entry.
+
+##### 6.3.8.1 End of block
+
+After symbol 256 the decoder reads one or two bits:
+
+| Bits | Meaning |
+|------|---------|
+| `1` | Another block of this entry follows; read a new block header (§6.3.3) immediately. |
+| `0 0` | The entry's data ends here. In a solid group the next entry continues with the current tables. |
+| `0 1` | The entry's data ends here. In a solid group the next entry starts with a block header (`tablesValid = false`). |
+
+An entry may also end without symbol 256: the decoder stops as soon as
+UNP_SIZE bytes have been produced, and any remaining payload bits are
+ignored. If the data ends (by `0 0`/`0 1`) before UNP_SIZE bytes exist, the
+entry is corrupt.
+
+#### 6.3.9 Filter records
+
+Symbol 257 introduces a filter record: the instruction to post-process a
+range of the output with one of the RAR 2.9 virtual-machine programs
+(standard programs for x86 call/jump targets ("E8", "E8E9"), Itanium
+branches, byte deltas, 24/32-bit images ("RGB") and audio, or an arbitrary
+program). The window keeps the unfiltered bytes; the filtered result is what
+is written to the file.
+
+Record framing:
+
+```
+first = bits(8)
+n = first & 7
+size = n + 1          if n <= 5         -- 1…6 bytes
+size = bits(8) + 7    if n == 6         -- 7…262 bytes
+size = bits(16)       if n == 7
+record = size bytes, each read with bits(8)
+```
+
+The upper bits of `first` and the record bytes describe which filter to run,
+the output range, and optional program bytecode, registers and global data.
+That content and the virtual machine are outside the scope of this
+document.
+
+#### 6.3.10 PPMd blocks
+
+A block header whose first bit is 1 starts a block coded with Dmitry
+Shkarin's PPMd (variant H) and a range coder instead of the LZ alphabets. It
+continues with model parameters, and inside the block an escape byte
+introduces commands (end of the PPMd block, end of the entry, filter
+records, and LZ-style matches). A PPMd block ends with a return to LZ mode,
+which reads a new block header. PPMd blocks are not specified further here.
+
+#### 6.3.11 Window and solid groups
+
+The window is the history of output bytes that matches may reach: up to the
+dictionary size in FILE_HEAD bits 5–7 (at most 4 MiB). In a non-solid entry
+no distance may exceed the number of bytes produced for that entry.
+
+In a solid archive, an entry with LHD_SOLID continues the stream of the
+previous entry: the window, `recent`, `lastLength`, `lowValue`, `lowRepeat`,
+`prevLengths`, the prefix codes and `tablesValid` all carry over, and matches
+may reach into earlier entries' output. Extracting such an entry requires
+decoding every preceding entry of the group in archive order. Each entry
+still produces exactly its own UNP_SIZE bytes, checked against its own
+FILE_CRC.
+
+### 6.4 Other compressed formats
+
+RAR 1.5 (UNP_VER 15), RAR 2.0 (20, 26) and the RAR 5.0/7.0 algorithms use
+bitstreams that differ from §6.3 (different alphabets, tables and control
+symbols). They are not specified in this document.
+
+### 6.5 Encryption
+
+| Container | Cipher | Key derivation |
+|-----------|--------|----------------|
+| Classic, RAR 2.0 | Proprietary RAR 2.0 cipher | Proprietary |
+| Classic, RAR 3.x–4.x | AES-128 in CBC mode | Iterated SHA-1 over the password (UTF-16LE) and the 8-byte SALT (2^18 rounds) yields key and IV |
+| RAR 5.0 | AES-256 in CBC mode | PBKDF2-HMAC-SHA256 with 2^KDF count iterations and a 16-byte salt (§4.4, §4.7) |
+
+Details are outside the scope of this document; an extractor without
+encryption support reports encrypted entries and header-encrypted archives
+as unsupported.
 
 ---
 
-## 12. The encoder side, briefly
+## 7. Semantics and de-facto behaviour
 
-This is the part of the format that is **closed**. WinRAR — the canonical
-encoder — is proprietary commercial software. The publicly available
-`unrar` source code is a decoder only; its license forbids using its code
-or implementation details to build a compatible compressor.
+### 7.1 Directory entries
 
-No publicly available specification describes the encoder. `technote.txt`
-shipped with WinRAR up through version 4.x describes only the on-disk
-bitstream that a **decoder** must consume. It does not describe:
+In the classic container an entry is a directory when the dictionary field
+of HEAD_FLAGS is 7 (`flags & 0xE0 == 0xE0`). Its PACK_SIZE and UNP_SIZE are
+0. RAR 1.5 predates the dictionary field; directories in such archives are
+identifiable only through ATTR (DOS attribute `0x10`). In RAR 5.0 the file
+flag `0x0001` marks directories.
 
-- The match-finding algorithm (hash chain depth, lazy-match thresholds,
-  match-length policies, the encoder's choice between short-match and
-  long-match paths for ambiguous lengths).
-- The Huffman tree construction (the encoder's frequency-counting strategy,
-  block-flush heuristics, table-reuse decisions).
-- The filter detection (how the encoder classifies a region as x86 vs ARM
-  vs RGB delta vs uncompressible, the size and shape of its sliding
-  classifier window, the false-positive guards).
-- The PPMd model selection (when to switch from LZSS to PPMd, the order
-  parameter, the memory budget, the model reset policy).
-- The VM filter generation (when, if ever, WinRAR emits a custom VM
-  program instead of a built-in filter).
+### 7.2 Order and duplicates
 
-No open-source RAR compressor has ever shipped. Not in `unrar` (decode-only
-by license). Not in libarchive (decode-only). Not in 7-Zip (decode-only,
-explicitly). Attempting one would be a clean-room re-derivation of a
-closed format, which is legally hazardous, and would in practice produce
-something that decompresses correctly only if every consumer is also
-implemented from the same re-derivation.
+Entries appear in the order the archiver wrote them, typically a directory
+after or before its contents with no guarantee either way. The same name may
+appear more than once (for example with LHD_VERSION). Readers must not
+assume uniqueness.
 
-SwiftRAR is a decoder library. It does not attempt compression and does
-not stub out a writer surface. This is the right scope.
+### 7.3 Path separators
+
+DOS-family hosts (HOST_OS 0–2) store `\`; readers presenting POSIX-style
+paths convert it to `/` for those hosts only. On Unix hosts `\` is a literal
+character.
+
+### 7.4 Missing ENDARC_HEAD
+
+Archives created before RAR 3.0 do not end with ENDARC_HEAD. Reaching end of
+file exactly at a block boundary is a normal end of archive. Ending inside a
+header or payload is truncation.
+
+### 7.5 Stored entries
+
+A stored, unencrypted entry has `PACK_SIZE == UNP_SIZE`. The FILE_CRC check
+applies as for compressed entries. Stored data does not pass through the
+decompression state.
+
+### 7.6 Split entries
+
+In a volume set an entry whose payload crosses a volume boundary has
+LHD_SPLIT_AFTER in the first part and LHD_SPLIT_BEFORE in the following
+parts. Only the final part's FILE_CRC can be relied on to be the CRC-32 of
+the whole unpacked file; for RAR 5.0, RARLAB documents that non-final parts
+carry a CRC of their packed data instead (§4.6). A part on its own is never a
+complete entry.
+
+### 7.7 Timestamps
+
+FTIME and EXT_TIME are local wall-clock times of the creating machine with no
+time zone. Software that needs an absolute instant has to assume one (for
+example UTC or the reader's own zone). RAR 5.0 times are absolute (Unix time
+or FILETIME, both UTC).
+
+### 7.8 LHD_LARGE
+
+The flag is set when a size does not fit in 32 bits. Readers combine the
+words as `HIGH << 32 | LOW` whenever the flag is set, regardless of the
+values.
+
+### 7.9 Observed writer behaviour (WinRAR 3.x)
+
+The following were observed in archives written by WinRAR 3.x and confirmed
+by comparing against independent extractors (§11.2):
+
+- MAIN_HEAD is exactly 13 bytes with flags `0x0000` (non-solid) and a valid
+  CRC16 over the whole header.
+- Every FILE_HEAD has LONG_BLOCK set and a CRC16 over the whole header,
+  including EXT_TIME.
+- ENDARC_HEAD is written as `C4 3D 7B 00 40 07 00`.
+- Compressed entries end when UNP_SIZE bytes have been produced: none of the
+  238 compressed entries in the validation corpus (§11.2) ends with symbol
+  256.
+- Long entries are split into several LZ blocks; every one of the 152
+  in-entry table refreshes in the corpus sets the keep bit (delta coding
+  against the previous lengths, §6.3.5).
+- Recent-distance matches (symbols 259–262) take no length bonus: the corpus
+  contains 4 321 of them at distances ≥ `0x101` (498 at ≥ `0x2000`), and the
+  output matches the reference extraction only without a bonus.
 
 ---
 
-## 13. References
+## 8. Robustness guidance for readers
 
-### 13.1 Primary specification sources
+Every field of an archive is untrusted. Recommended checks:
 
-| Source                          | License                         | Coverage                                                                  |
-|---------------------------------|---------------------------------|---------------------------------------------------------------------------|
-| WinRAR `technote.txt` (≤ 4.x)   | Copyright win.rar GmbH; routinely cited under interop fair-use | RAR3 block formats, FILE_HEAD/MAIN_HEAD fields, method bytes, the LZSS bitstream at a high level, filter-spec encoding. The canonical reference. |
-| WinRAR `UnRARSrc` `unpack.cpp`  | Custom unrar source license — read-only, not redistributable in derivative compressors | The reference C++ decoder implementation. Cite for spec confirmation; do not copy code. |
-| Kaitai Struct RAR specification | Permissive (MIT-style)         | A clean re-derivation of the RAR3 block structure as a Kaitai .ksy file. Suitable as a base for clean-room implementations. |
-| `rarfile.py` (Marko Kreen)      | ISC (permissive)               | Pure-Python decoder covering RAR3 LZSS, RAR3 STORE, filename encoding, recovery-record parsing, and RAR5 base-header walks. Excellent reference and citable. |
-| 7-Zip RAR sources               | LGPL — citable but not copyable| Detailed C++ decoder for both RAR3 and RAR5. Cite for behavioral confirmation; **do not** copy code into a permissive project. |
-| Wikipedia "RAR (file format)"   | CC BY-SA                       | High-level history, version timeline, format-comparison context.          |
-
-### 13.2 Format-adjacent technical references
-
-| Source                                       | Coverage                                                                  |
-|----------------------------------------------|---------------------------------------------------------------------------|
-| Salomon & Motta, *Handbook of Data Compression*, 5th ed. | LZSS, canonical Huffman, arithmetic coding, PPM family theory. |
-| Cleary & Witten, "Data Compression Using Adaptive Coding and Partial String Matching" (IEEE Trans. Comm. 1984) | Original PPM paper. |
-| Shkarin, "PPM: One Step to Practicality" (DCC 2002) | PPMII algorithm description (the variant RAR3 uses for method 0x36). |
-| RFC 1951 (DEFLATE)                           | Reference for canonical Huffman, MSB vs LSB bitstream ordering, and how DEFLATE differs from RAR3's bitstream conventions. |
-| ISO/IEC 13818-2 §6.2.3                       | Reed-Solomon over GF(256) — the math that underlies RAR recovery records. |
-| RFC 7693 (BLAKE2)                            | BLAKE2sp specification — RAR5's content hash.                              |
-
-### 13.3 URLs
-
-- WinRAR / technote.txt: shipped with the WinRAR distribution; `unrar` source
-  is mirrored at `rarlab.com/rar_add.htm` and `github.com/aawc/unrar` and
-  similar mirrors.
-- Kaitai Struct RAR spec: `github.com/kaitai-io/kaitai_struct_formats` —
-  see `archive/rar.ksy`.
-- rarfile.py: `github.com/markokr/rarfile`. ISC-licensed.
-- 7-Zip sources: `7-zip.org/sdk.html` and `github.com/mcmilk/7-Zip-zstd`.
-- Wikipedia: `en.wikipedia.org/wiki/RAR_(file_format)`.
+| Concern | Guidance |
+|---------|----------|
+| Signature search | Bound the search (1 MiB plus the signature length). |
+| HEAD_SIZE | Reject values below 7, below the fixed size of the block type (13 MAIN, 32/40 FILE and NEWSUB), or beyond the end of the input. A zero HEAD_SIZE would stall a naive walker. |
+| NAME_SIZE, optional fields | Must fit inside HEAD_SIZE; otherwise the header is malformed. |
+| PACK_SIZE / ADD_SIZE | 64-bit, overflow-checked addition; the payload must lie inside the input. |
+| UNP_SIZE | Archive-controlled. Never pre-allocate it blindly; cap output at it and let callers impose their own limit. On 32-bit platforms it may not be addressable. |
+| Header CRC | Verify where §6.2 defines a span; a mismatch means the header cannot be trusted. |
+| Decompression | Every table read must stay in bounds; reject over-subscribed codes and repeat-previous at index 0; reject distances of 0 or beyond the produced output; stop at UNP_SIZE; treat end of input before UNP_SIZE bytes as truncation; verify FILE_CRC afterwards. The output loop must make progress per symbol, so it terminates. |
+| Compact UTF-16 names | Bound every index by the input lengths and the output by the 8-bit name length (opcode 3) and the encoded length. |
+| EXT_TIME | Every record must fit inside HEAD_SIZE. |
+| Names | Treat as hostile: strip drive prefixes and leading separators, reject `..`, and do not follow symbolic-link entries when extracting. |
+| Contradictions | Prefer the most conservative interpretation, e.g. a split flag in an archive without MHD_VOLUME means the entry is incomplete. |
+| RAR 5.0 | Bound vints to 10 bytes and Header size to 3 vint bytes (2 MiB); check extra-record sizes against the extra area; check that Extra area size ≤ Header size. |
 
 ---
 
-## 14. SwiftRAR scope
+## 9. Errata
 
-SwiftRAR is a Swift decoder library for the RAR3 archive format. It is
-not a codec (no compression), not a 100%-WinRAR-compatible reader (PPMd
-is permanently out of scope), and not a hex viewer (the API surface
-returns extracted bytes or typed errors). This section enumerates
-exactly what is built, what is on the roadmap, and what is and will
-remain out of scope, with the rationale for each item.
+### 9.1 RARLAB documents
 
-### 14.1 Implemented
+| # | Document | Statement | Correction | Evidence |
+|---|----------|-----------|------------|----------|
+| E1 | technote 3.93 | Declares block types `0x72`–`0x7A` only | RAR 3.x writes ENDARC_HEAD (`0x7B`) at the end of every archive | Observed in WinRAR 3.x archives (§7.9) |
+| E2 | technote 1.53 | MAIN_HEAD flag `0x10` "unused" | Reassigned in RAR 3.x to new-style volume naming (technote 3.93) | Later technote |
+| E3 | technote 3.93 | FILE_HEAD CRC covers "fields from HEAD_TYPE to FILEATTR and file name" | The CRC also covers SALT, EXT_TIME and any other bytes up to HEAD_SIZE | Verified on WinRAR 3.x archives with EXT_TIME (§11.2) |
+| E4 | technote 3.93 | LHD_LARGE used for files "larger than 2Gb" | The low words are unsigned 32-bit; readers must honour the flag whenever it is set and not infer it from size | Field definitions |
+| E5 | technote 3.93 | MAIN_HEAD described as fixed 13 bytes | HEAD_SIZE governs; later versions add bytes after offset 13 | §3.5.1 |
+| E6 | RAR 5.0 format description | General header table gives the type of "Data area" as vint | The data area is raw bytes whose length is "Data size" | The same document's text |
 
-- `RARError` — typed error vocabulary: `notRAR`, `truncated`, header CRC
-  mismatch, data CRC mismatch, `unsupportedCompression(method:)`,
-  `unsupportedFeature(String)`, `entryOffsetOutOfRange`.
-- RAR3 signature detection with a 1 MiB SFX-stub scan window. Both the
-  bare `Rar!\x1a\x07\x00` magic and SFX-prefixed archives parse.
-- RAR5 signature detection. RAR5 archives are recognized as RAR
-  (not misclassified as notRAR) and then refused with
-  `unsupportedFeature("RAR5 block parsing")` so the caller can route to
-  another tool.
-- RAR3 MAIN_HEAD (0x73) parser with main-flags decoding for
-  volume / solid / password / lock / new-numbering.
-- RAR3 FILE_HEAD (0x74) parser, including:
-  - Large-file (> 4 GB) high-word handling for PACK_SIZE and UNP_SIZE.
-  - CP437/Latin-1 filename pass-through. The compressed UTF-16 tail is
-    skipped, not decoded — see deferred items.
-  - DOS timestamp decoding.
-  - Host-OS attribute pass-through.
-  - Method byte, CRC32, ATTR, HOST_OS — all exposed as `RAREntry` fields.
-- RAR3 block-stream iterator that walks every block type, dispatches
-  MAIN/FILE/ENDARC, skips auxiliary types (COMMENT/AV/SUB/PROTECT/SIGN/NEWSUB),
-  and guards against zero-advance corruption loops.
-- Bounds-checked little-endian `ByteReader` for header parsing.
-- Public value-type `RAREntry` (name, sizes, method, CRC32, host-OS,
-  attributes, modDate, flags, dataOffset).
-- Public static API `RARArchive.entries(_:)`, `RARArchive.extract(entry:from:)`,
-  `RARArchive.isRARArchive(_:)`.
-- STORE method (0x30) extraction with CRC32 verification and entry-offset
-  guards.
-- CRC32 — IEEE 802.3, reflected polynomial 0xEDB88320, lazily-built lookup
-  table with a `Data` fast path.
-- MSB-first `BitStream` with a 64-bit shift register, `peek` / `advance` /
-  `readBits` / `alignToByte`, and graceful tail-zero behavior at exhaustion.
-- Canonical Huffman decoder (`RAR3HuffmanDecoder`) — max 15 bits,
-  over-subscription detection, empty-table sentinel.
-- RAR3 code-length pre-tree decoder with delta-XOR against the previous
-  block, and 16/17/18 RLE expansion symbols.
-- RAR3 LZSS lookup tables — length base/extra (28 entries), distance
-  base/extra (60 entries, computed from the 16-element seed array
-  `distanceBitLengthCounts`), short-match distance table (8 entries),
-  low-distance alphabet constants.
-- RAR3 LZSS block driver for methods 0x31..0x35:
-  - 4 MB sliding window.
-  - Four-tree Huffman dispatch (main / length / distance / low-distance).
-  - Recent-distance LRU.
-  - Short-match path (main symbols 259..262).
-  - Long-match path with the high/low split for distances with extra
-    bits ≥ 4.
-  - Repeat-last-distance (symbol 258).
-  - Keep-old-tables flag honoring.
-  - End-of-block protocol (1 / 00 / 01).
-- Method-byte dispatch in `RARArchive.extract` — routes 0x30 to
-  `StoreExtractor`, 0x31..0x35 to `RAR3LZSSDecoder`, rejects encrypted /
-  solid / unknown methods with typed errors.
-- 47 passing tests covering signature detection, header parsing, store
-  extraction, LZSS extraction, CRC verification, and error-typing edges.
+### 9.2 Earlier revisions of this document
 
-### 14.2 Deferred (reachable from public spec)
+| # | Earlier statement | Correction |
+|---|-------------------|------------|
+| R1 | EXT_TIME is 2–19 bytes | 2–26 bytes (§3.11) |
+| R2 | RAR5 compression information: dictionary in bits 10–13 | Bits 10–14 (`0x7C00`), plus version-1 fraction bits (§4.6.1) |
+| R3 | RAR5 solid mode via header flag `0x0004` | Header flag `0x0004` is "skip if unknown"; solid is archive flag `0x0004` and compression-information bit `0x0040` |
+| R4 | RAR5 file record listed mtime and CRC32 as always present | Both are optional (file flags `0x0002`, `0x0004`) |
+| R5 | RAR 2.9 described as "four-tree dynamic Huffman" | The codes are static within a block and transmitted per block (§6.3.5) |
+| R6 | RAR5 end/main/file records documented partially | Completed (§4) |
+| R7 | Implementation notes and source descriptions relied on third-party decoder source code | Rewritten from public documentation and black-box observation (§11) |
 
-These items are absent today but their specifications are public and
-their effort is bounded. They form the roadmap for a "100% of the
-publicly-documented decoder surface" target.
+---
 
-| Feature                                       | Effort      | Rationale |
-|-----------------------------------------------|-------------|-----------|
-| VM filter execution (E8/E8E9, RGB delta, audio delta, ARM, custom-program VM) | ~1 week | Spec is public (technote + rarfile.py + Kaitai). Filter spec parsing is already wired into the LZSS decoder; only the execution engine is missing. Without it, filtered binaries decompress to the pre-filter (uncorrected) bytes — correct for unfiltered archives, wrong for filtered ones. |
-| Solid-mode dictionary inheritance              | 2-3 days    | Spec is straightforward — the sliding window must persist across FILE_HEAD boundaries when MHD_SOLID is set. The fix is to hold a per-archive decoder instance across iterator advances. |
-| UTF-16-compressed filename decoding (LHD_UNICODE secondary stream) | 1-2 days | The compression scheme is documented in technote and rarfile.py implements it cleanly. Non-blocking for ASCII filenames. |
-| Header CRC16 verification                      | half a day  | Pure correctness hardening. CRC16/IBM is trivial; the field is already read into a local. |
-| RAR5 base-header vint parsing + block walk     | 1-2 weeks   | Spec is public (unrar5 technote shipped 2013-2014 alongside WinRAR 5.0; rarfile.py covers the same surface in ISC). This is a separate parser cluster from RAR3, not a refactor of it. |
-| RAR5 LZSS-family decompressor                  | 2-3 weeks   | RAR5 changed the dictionary geometry (up to 1 GB), the symbol alphabet sizes, and the filter set, but the bitstream shape and canonical-Huffman machinery are familiar. The BitStream + Huffman decoder + table-refresh scaffolding already in the package transfers directly. |
-| Multi-volume continuation (`.r00` / `.partNN.rar`) | 3-5 days | Iterator currently rejects volume archives. Joining volumes is a stream-concatenation problem at the byte level plus split-before/split-after FILE_HEAD flag handling — both well documented. |
-| Recovery records (PROTECT_HEAD 0x78 / RAR5 recovery service) parsing and repair | 1-2 weeks | RAR's recovery format is documented (Reed-Solomon over 512-byte sectors). Reachable in principle but out of scope for a decoder-only library shipping its first release. |
-| AES-128 / AES-256 entry decryption (password-derived key) | ~1 week | Both RAR3 (AES-128 + custom KDF) and RAR5 (AES-256 + PBKDF2-SHA-256) are publicly documented. CommonCrypto / CryptoKit provide the primitives. Currently throws `unsupportedFeature("encrypted entries")`. Substantial security-sensitive cluster — should ship with a careful threat model. |
-| RAR5 BLAKE2sp content-hash verification        | 1-2 days (if a BLAKE2sp dep is acceptable) | Not unreachable — BLAKE2sp is RFC 7693 + parallel-mode. Flagged because Swift's first-party ecosystem doesn't ship BLAKE2sp and adopting a dependency is a meaningful decision. |
+## 10. Implementation status (SwiftRAR)
 
-### 14.3 Permanently out of scope
+| Feature | Section | Status | Notes |
+|---------|---------|--------|-------|
+| Classic signature, SFX stub ≤ 1 MiB | §3.1 | Supported | |
+| RAR 5.0 signature | §4.1 | Detected only | `RARError.unsupportedFeature(.rar5Archive)` |
+| RAR 1.3/1.4 (`RE~^`) | §1.2 | Unsupported | Reported as not RAR |
+| Block walk, skipping 0x75–0x79, NEWSUB and unknown types | §3.3 | Supported | Missing ENDARC tolerated; nothing after ENDARC read |
+| HEAD_CRC verification | §6.2 | Supported | MAIN, FILE, NEWSUB, ENDARC; embedded-comment spans; legacy and unknown blocks not checked |
+| MAIN_HEAD flags | §3.5 | Partial | MHD_VOLUME → `.multiVolume`, MHD_PASSWORD → `.encryptedHeaders`; others informational |
+| FILE_HEAD fields, LHD_LARGE, SALT skip | §3.6 | Supported | |
+| Split entries | §7.6 | Unsupported | `.multiVolume` |
+| Names: 8-bit, UTF-8, compact UTF-16 | §3.13 | Supported | 8-bit names decoded as UTF-8 when valid, else CP437; `\` → `/` for hosts 0–2 |
+| DOS time | §3.12 | Supported | Interpreted as UTC; invalid → `nil` |
+| EXT_TIME | §3.11 | Partial | mtime refinement applied; ctime/atime/arctime parsed and skipped |
+| Directory entries | §7.1 | Partial | Dictionary field 7; RAR 1.5 attribute-only directories not detected |
+| Store | §5.2 | Supported | |
+| RAR 2.9 LZ, non-solid | §6.3 | Supported | Validated byte-for-byte against bsdtar on real WinRAR 3.x archives (§11.2). The low-distance repeat symbol (16) and its reset on table reads do not occur in that corpus and are covered by spec-derived unit tests only |
+| Solid continuation entries | §6.3.11 | Unsupported | `.solidEntry`; the first entry of a solid group extracts |
+| Filter records | §6.3.9 | Unsupported | `.vmFilter` |
+| PPMd blocks | §6.3.10 | Unsupported | `.ppmd` |
+| RAR 1.5 / 2.0 algorithms | §6.4 | Unsupported | `.compressionVersion(v)` |
+| Encryption | §6.5 | Unsupported | `.encryptedHeaders`, `.encryptedEntry` (entries still listed) |
+| FILE_CRC verification | §6.1 | Supported | `.dataCRCMismatch` |
+| Comments, recovery records, AV, NEWSUB services | §3.7–§3.9 | Unsupported | Skipped |
+| RAR 5.0 container and compression | §4 | Unsupported | |
+| Writing archives | — | Out of scope | |
 
-These items are not on the roadmap, will not be added, and the rationale
-for excluding them is documented here so the next phase of work does not
-relitigate them.
+---
 
-**PPMd decompression (Shkarin PPMII — RAR3 method 0x36).** PPMII / PPMd-J1
-by Dmitry Shkarin is covered by patent and proprietary-license claims that
-remain in effect as of 2025. Every shipping implementation (7-Zip, unrar)
-inherits from Shkarin's own source under terms that do not permit clean-room
-MIT/Apache redistribution. There is no specification document independent
-of that source — the algorithm is the source. SwiftRAR rejects PPMd-mode
-blocks at the bitstream level with `RARError.unsupportedFeature("RAR3 PPMd
-block ... requires PPMII port")` and is explicit about this in the README.
+## 11. References and provenance
 
-**RAR compression / archive writing.** The RAR format is closed-source on
-the writer side. WinRAR is proprietary commercial software. The public
-`technote.txt` describes only the bitstream a decoder must consume, not
-the match-finder, entropy-coder, or filter-detection choices the encoder
-makes. No open-source RAR compressor has ever shipped — not in unrar
-(decode-only by license), not in libarchive, not in 7-Zip. Attempting one
-would be a clean-room re-derivation of a closed format (legally hazardous)
-or fabrication.
+### 11.1 References
 
-**WinRAR AV-block (0x76) cryptographic verification.** AV records use a
-WinRAR-proprietary signing scheme whose verification keys and algorithm
-details have never been published. Parsing the block structure is reachable
-(SwiftRAR skips the block as an unknown auxiliary type); verifying it
-cryptographically is not.
+| Reference | Author / publisher | Used for |
+|-----------|--------------------|----------|
+| "RAR version 1.53 – Technical information" (`technote.txt`) | Eugene Roshal | Block layout, MAIN/FILE/COMMENT headers, CRC note |
+| "RAR version 3.93 – Technical information" (`technote.txt`, shipped with RAR/WinRAR) | Eugene Roshal / RARLAB | Block types, MAIN/FILE flags, LHD_UNICODE, SALT, EXT_TIME presence |
+| "RAR 5.0 archive format" (rarlab.com/technote.htm) | RARLAB | §4 |
+| "RAR (file format)", Wikipedia | Wikipedia contributors | History and version overview |
+| RFC 1951, "DEFLATE Compressed Data Format Specification" | L. Peter Deutsch | Canonical prefix-code construction (§6.3.4) |
+| "Catalogue of parametrised CRC algorithms" | Greg Cook | CRC-32/ISO-HDLC parameters and check value |
+| RFC 7693, "The BLAKE2 Cryptographic Hash and MAC" | M-J. Saarinen, J-P. Aumasson | BLAKE2sp background |
+| D. Shkarin, "PPM: one step to practicality" (DCC 2002) | Dmitry Shkarin | PPMd background |
+| IANA media type registration `application/vnd.rar` | IANA | §1.3 |
 
-### 14.4 Honest README positioning
+### 11.2 Provenance
 
-SwiftRAR's README presents the library as a decoder for STORE (0x30) and
-RAR3 LZSS (0x31..0x35) archives. It rejects encrypted, solid, multi-volume,
-PPMd-mode, and RAR5 inputs with typed `RARError` values so callers can
-route users to a more capable tool (The Unarchiver on macOS, 7-Zip
-elsewhere). This is what is actually built, and it is sufficient for the
-target use cases (textmode-era archives, plain stored or LZSS-compressed
-content, single-volume non-encrypted non-solid). It is not sufficient as
-a drop-in WinRAR replacement, and the README does not claim otherwise.
+This document was written from the public documents listed in §11.1 and
+from black-box observation: real archives written by WinRAR 3.x were
+extracted with an independent tool (bsdtar 3.5.3 / libarchive 3.7.4, used
+only as an executable) and the results were compared byte for byte, and CRC
+for CRC, with an implementation written from this document. The validation
+corpus was two archives with 242 entries: 238 RAR 2.9 LZ files, two stored
+files and two directories, three of the headers carrying EXT_TIME; every file
+matched and every name and directory agreed with the reference listing. Facts about the RAR 2.9
+bitstream that RARLAB does not publish (§6.3) are stated as the author
+understands the format and are confirmed by that comparison. No third-party
+source code (unrar, 7-Zip, libarchive, The Unarchiver or any other RAR
+implementation) was consulted, quoted or paraphrased while writing this
+document or SwiftRAR's implementation.
 
-The deferred items (§14.2) are a published roadmap. The unreachable items
-(§14.3) are published non-goals. Together they describe an honest scope
-that matches what the package can credibly ship and maintain.
+RAR and WinRAR are trademarks of their owner. The RAR format was designed by
+Eugene Roshal and is maintained by RARLAB (win.rar GmbH). SwiftRAR only
+reads archives; it does not create them.
