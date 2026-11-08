@@ -4,21 +4,23 @@ import Foundation
 ///
 /// The two formats share an identical 6-byte prefix (`"Rar!\x1A\x07"`) but
 /// diverge in the trailing version bytes and in the entire structure of the
-/// blocks that follow. SwiftRAR uses this enum to select the correct parser
-/// once a signature has been located.
+/// blocks that follow. Only ``classic`` archives can be listed and
+/// extracted; ``rar5`` is detected so callers can route it elsewhere.
 public enum RARFormat: Equatable, Sendable {
-    /// RAR 1.5 through 4.x. Signature is 7 bytes (terminating `0x00`). Uses
-    /// the classic block-header scheme (HEAD_CRC / HEAD_TYPE / HEAD_FLAGS /
-    /// HEAD_SIZE).
+    /// RAR 1.5 through 4.x. Signature is 7 bytes (`Rar!\x1A\x07\x00`).
+    /// Uses the classic block-header scheme (HEAD_CRC / HEAD_TYPE /
+    /// HEAD_FLAGS / HEAD_SIZE).
     case classic
 
-    /// RAR 5.0 and newer. Signature is 8 bytes (`0x01 0x00` trailer). Uses
-    /// vint-encoded base headers.
+    /// RAR 5.0 and newer. Signature is 8 bytes (`Rar!\x1A\x07\x01\x00`).
+    /// Uses vint-encoded headers. Not parsed by SwiftRAR.
     case rar5
 }
 
 /// Detector for RAR archive signatures, including self-extracting (SFX)
 /// archives that prepend an executable stub to the actual RAR data.
+///
+/// The RAR 1.4 signature (`RE~^`) is not recognised.
 public enum RARSignature {
 
     /// 7-byte signature for RAR 1.5-4.x: `"Rar!" 0x1A 0x07 0x00`.
@@ -27,9 +29,9 @@ public enum RARSignature {
     /// 8-byte signature for RAR 5.0+: `"Rar!" 0x1A 0x07 0x01 0x00`.
     public static let rar5Bytes: [UInt8] = [0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00]
 
-    /// Largest SFX (self-extracting) stub size we will scan past to look for a
-    /// signature. RAR 5.0 caps SFX stubs at 1 MiB; classic RAR has no formal
-    /// cap but the same convention is used by libarchive and rarfile.
+    /// Largest self-extractor stub, in bytes, scanned past when looking for a
+    /// signature (1 MiB, the limit RAR itself documents for RAR 5.0 SFX
+    /// modules and a common convention for older ones).
     public static let sfxScanLimit = 1 << 20  // 1 MiB
 
     /// The result of a successful signature detection.
@@ -46,10 +48,14 @@ public enum RARSignature {
     }
 
     /// Locate a RAR signature in `data`, scanning the first
-    /// `RARSignature.sfxScanLimit` bytes to accommodate self-extracting
-    /// archives.
+    /// ``sfxScanLimit`` bytes to accommodate self-extracting archives.
     ///
-    /// Returns `nil` if no recognised signature is found in the scan window.
+    /// The first candidate wins; no blocks are parsed.
+    ///
+    /// - Parameter data: Candidate archive bytes. Offsets in the result are
+    ///   relative to `data.startIndex`.
+    /// - Returns: The detected format and offsets, or `nil` if no recognised
+    ///   signature is found in the scan window.
     public static func detect(_ data: Data) -> Detection? {
         let limit = min(data.count, sfxScanLimit + rar5Bytes.count)
         guard limit >= classicBytes.count else { return nil }

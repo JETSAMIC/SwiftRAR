@@ -73,12 +73,9 @@ final class StoreTests: XCTestCase {
     }
 
     func testExtractRejectsMalformedCompressedEntry() {
-        // Method 0x33 is one of the five RAR3 LZSS variants — those now
-        // dispatch into the real decoder. Feeding it 100 bytes of zeros
-        // is structurally invalid (the all-zero pre-tree contains no
-        // codeable symbols), so the decoder must surface a typed
-        // RARError rather than crashing. Exact subcase varies depending
-        // on which guard fires first.
+        // Method 0x33 with UNP_VER 29 is RAR 2.9 LZ. A payload of zeros
+        // sends an all-zero pre-code, which cannot code any length
+        // (Reference §6.3.5), so extraction must fail with a typed error.
         let entry = RAREntry(
             name: "fake.bin",
             unpackedSize: 100,
