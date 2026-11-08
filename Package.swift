@@ -16,5 +16,6 @@ let package = Package(
     targets: [
         .target(name: "SwiftRAR"),
         .testTarget(name: "SwiftRARTests", dependencies: ["SwiftRAR"])
-    ]
+    ],
+    swiftLanguageModes: [.v6]
 )
